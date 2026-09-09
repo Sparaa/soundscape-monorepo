@@ -119,8 +119,13 @@ def check_range(start: Optional[float], end: Optional[float], duration: Optional
         )
 
 
+AUDIO_FORMAT = "m4a"   # AAC in an mp4 container: browsers, ffmpeg and H3's audio loader all read it
+
+
 def build_clip_cmd(url: str, out_dir: str, start: Optional[float], end: Optional[float],
-                   max_height: int = MAX_HEIGHT) -> list[str]:
+                   max_height: int = MAX_HEIGHT, audio_only: bool = False) -> list[str]:
+    """audio_only (2026-09-08, sound references): best audio stream only,
+    extracted to AUDIO_FORMAT — the same start/end window applies."""
     cmd = [
         "yt-dlp",
         "--no-playlist",
@@ -129,11 +134,12 @@ def build_clip_cmd(url: str, out_dir: str, start: Optional[float], end: Optional
         "--no-cache-dir",
         "--socket-timeout", "30",
         "--retries", "3",
-        "-f", format_selector(max_height),
-        "--merge-output-format", "mp4",
-        "--remux-video", "mp4",
-        "-o", os.path.join(out_dir, "clip.%(ext)s"),
     ]
+    if audio_only:
+        cmd += ["-f", "bestaudio/b", "-x", "--audio-format", AUDIO_FORMAT, "--audio-quality", "0"]
+    else:
+        cmd += ["-f", format_selector(max_height), "--merge-output-format", "mp4", "--remux-video", "mp4"]
+    cmd += ["-o", os.path.join(out_dir, "clip.%(ext)s")]
     sec = section_arg(start, end)
     if sec:
         # force-keyframes re-encodes the window so the cut lands exactly on the
@@ -193,13 +199,14 @@ def thumbnail_data_url(url: str, timeout: float = 15.0) -> Optional[str]:
     return f"data:{ctype};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def find_output(out_dir: str) -> Optional[Path]:
-    """yt-dlp names the merged file clip.mp4; a remux fallback may leave
-    another extension. Prefer mp4, else the single largest media file."""
+def find_output(out_dir: str, audio_only: bool = False) -> Optional[Path]:
+    """yt-dlp names the merged file clip.mp4 (clip.m4a for audio-only); a
+    remux fallback may leave another extension. Prefer the expected name,
+    else the single largest media file."""
     p = Path(out_dir)
-    mp4 = p / "clip.mp4"
-    if mp4.exists():
-        return mp4
+    want = p / (f"clip.{AUDIO_FORMAT}" if audio_only else "clip.mp4")
+    if want.exists():
+        return want
     cands = [f for f in p.iterdir() if f.is_file() and not f.name.endswith((".part", ".ytdl", ".json"))]
     if not cands:
         return None
@@ -278,6 +285,7 @@ class ClipRequest(BaseModel):
     url: str
     start: Optional[float] = Field(default=None, ge=0)
     end: Optional[float] = Field(default=None, ge=0)
+    audio_only: bool = False  # sound reference: best audio only (m4a)
 
 
 @app.post("/clip")
@@ -299,10 +307,12 @@ async def clip(req: ClipRequest) -> FileResponse:
     out_dir = tempfile.mkdtemp(prefix="clip-", dir=SCRATCH_DIR)
     try:
         async with _gate:
-            rc, _out, err = await _run(build_clip_cmd(url, out_dir, req.start, req.end), FETCH_TIMEOUT_SEC)
+            rc, _out, err = await _run(
+                build_clip_cmd(url, out_dir, req.start, req.end, audio_only=req.audio_only), FETCH_TIMEOUT_SEC
+            )
         if rc != 0:
             raise HTTPException(status_code=422, detail=_ytdlp_error(err))
-        path = find_output(out_dir)
+        path = find_output(out_dir, audio_only=req.audio_only)
         if path is None:
             raise HTTPException(status_code=502, detail="download produced no file")
     except Exception:
@@ -315,12 +325,13 @@ async def clip(req: ClipRequest) -> FileResponse:
         "X-Clipgrab-Title": urllib.parse.quote(title, safe=""),
         "X-Clipgrab-Source": urllib.parse.quote(meta.get("webpageUrl") or url, safe=":/?=&%"),
         "X-Clipgrab-Duration": str(meta.get("durationSec") or ""),
+        "X-Clipgrab-Kind": "audio" if req.audio_only else "video",
         "Cache-Control": "no-store",
     }
     return FileResponse(
         str(path),
-        media_type="video/mp4",
-        filename="clip.mp4",
+        media_type="audio/mp4" if req.audio_only else "video/mp4",
+        filename=f"clip.{AUDIO_FORMAT}" if req.audio_only else "clip.mp4",
         headers=headers,
         background=BackgroundTask(shutil.rmtree, out_dir, ignore_errors=True),
     )

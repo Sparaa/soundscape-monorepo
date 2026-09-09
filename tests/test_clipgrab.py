@@ -90,3 +90,19 @@ def test_thumbnail_data_url_refuses_private_and_bad(monkeypatch):
         headers = {"Content-Type": "text/html"}
     monkeypatch.setattr(cg.urllib.request, "urlopen", lambda req, timeout: Html())
     assert cg.thumbnail_data_url("https://i.ytimg.com/vi/x/hq.jpg") is None
+
+
+def test_build_clip_cmd_audio_only():
+    cmd = cg.build_clip_cmd("https://x.example/v", "/scratch/a", 3, 9, audio_only=True)
+    assert "-x" in cmd and cmd[cmd.index("--audio-format") + 1] == cg.AUDIO_FORMAT
+    assert cmd[cmd.index("-f") + 1] == "bestaudio/b"
+    assert "--merge-output-format" not in cmd and "--remux-video" not in cmd
+    assert cmd[cmd.index("--download-sections") + 1] == "*3.000-9.000"  # the window still applies
+    assert cg.ClipRequest(url="https://x.example/v").audio_only is False
+
+
+def test_find_output_prefers_m4a_for_audio(tmp_path):
+    (tmp_path / "clip.m4a").write_bytes(b"a" * 10)
+    (tmp_path / "clip.webm").write_bytes(b"b" * 100)
+    assert cg.find_output(str(tmp_path), audio_only=True).name == "clip.m4a"
+    assert cg.find_output(str(tmp_path)).name == "clip.webm"  # no mp4: largest media file
