@@ -1,0 +1,5 @@
+# Web layer only — the model runtime (torch, transformers, soundfile, ...) is
+# installed by the yue2-infer package itself in the Dockerfile.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
