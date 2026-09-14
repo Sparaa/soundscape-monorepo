@@ -180,7 +180,8 @@ def normalize_abc(raw: Optional[str]) -> Optional[str]:
 
 def build_request(style: str, lyrics: str, cot: Optional[str] = None, seed: Optional[int] = None,
                   cfg_scale: Optional[float] = None, song_id: Optional[str] = None,
-                  abc: Optional[str] = None, long: Any = None) -> dict[str, Any]:
+                  abc: Optional[str] = None, long: Any = None,
+                  hook_abc: Optional[str] = None, hook_sections: Any = None) -> dict[str, Any]:
     """Validate and shape a request into yue2.protocol.SongRequest kwargs (+ a
     `long` options dict the worker strips before building the SongRequest).
     abc = an external score (cover mode): YuE2 tokenizes it instead of planning
@@ -196,6 +197,14 @@ def build_request(style: str, lyrics: str, cot: Optional[str] = None, seed: Opti
     long_opts = normalize_long(long)
     if abc is not None and long_opts is not None:
         raise BadRequest("a cover score cannot be combined with long mode")
+    hook = normalize_hook(hook_abc, hook_sections)
+    if hook is not None:
+        if cot == "off":
+            raise BadRequest("a hook riff needs cot=melody or full (the plan is spliced)")
+        if abc is not None:
+            raise BadRequest("hook_abc and abc are exclusive — the hook is spliced into a fresh plan")
+        if long_opts is not None:
+            raise BadRequest("a hook riff cannot be combined with long mode")
     if seed is None:
         seed = random.randrange(0, 2**31)
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**63:
@@ -215,6 +224,8 @@ def build_request(style: str, lyrics: str, cot: Optional[str] = None, seed: Opti
         req["abc"] = abc
     if long_opts is not None:
         req["long"] = long_opts
+    if hook is not None:
+        req["hook"] = hook
     return req
 
 
@@ -336,6 +347,365 @@ def stitch_chunks(chunks: list[np.ndarray], sr: int, crossfade_ms: float,
         chunk = trim_edges(chunk, sr, trim_start_s if i > 0 else 0.0, trim_end_s if i < n - 1 else 0.0)
         out = chunk if out is None else equal_power_crossfade(out, chunk, int(round(crossfade_ms / 1000.0 * sr)))
     return out if out is not None else np.zeros((0, 2), dtype=np.float32)
+
+
+# ---- cover riffs: ABC section model + hook splicing --------------------------
+#
+# YuE2's plan ABC and SheetSage2's transcription share one dialect: header
+# lines (X: T: M: L: Q: V:defs K:), then "% label" section markers, each
+# section a run of "V: Vocal" / "V: Ins" line groups. Hook-only riffs (2026-
+# 09-13) plan a fresh song for the lyrics, then replace the plan's chorus
+# sections with the source's chorus bars — new verses, the original hook.
+
+_HEADER_LINE_RE = re.compile(r"^[A-Za-z]:")
+_CHORD_RE = re.compile(r'"[^"]*"')
+_REST_BARS_RE = re.compile(r"^Z(\d*)$")
+
+
+def parse_abc(abc: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """→ (header lines, [(section label, body lines)]); music before the first
+    '% label' marker lands in a section labelled ''."""
+    headers: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    in_header = True
+    for raw in (abc or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("%"):
+            in_header = False
+            sections.append((line.lstrip("%").strip(), []))
+            continue
+        if in_header and _HEADER_LINE_RE.match(line) and (not line.startswith("V:") or "clef=" in line or "name=" in line):
+            # X:/T:/M:/L:/Q:/K: and the voice DEFINITIONS (clef=/name=) are the
+            # header; a bare "V: Vocal" switch belongs to the music body
+            headers.append(line)
+            continue
+        in_header = False
+        if not sections:
+            sections.append(("", []))
+        sections[-1][1].append(line)
+    return headers, sections
+
+
+def render_abc(headers: list[str], sections: list[tuple[str, list[str]]]) -> str:
+    out = list(headers)
+    for label, lines in sections:
+        if label:
+            out.append(f"% {label}")
+        out.extend(lines)
+    return "\n".join(out) + "\n"
+
+
+def abc_header_value(headers: list[str], field: str) -> Optional[str]:
+    for h in headers:
+        if h.startswith(field + ":"):
+            return h[len(field) + 1:].strip()
+    return None
+
+
+def strip_chords(abc: str) -> str:
+    """Drop chord symbols ("F", "Dm7/C") from music lines; V: definitions keep their quoted names."""
+    out = []
+    for line in (abc or "").splitlines():
+        out.append(line if _HEADER_LINE_RE.match(line) else _CHORD_RE.sub("", line))
+    return "\n".join(out) + ("\n" if abc.endswith("\n") else "")
+
+
+def _units_per_bar(meter: str, unit: str) -> Optional[int]:
+    try:
+        mn, md = (int(x) for x in meter.split("/"))
+        ln, ld = (int(x) for x in unit.split("/"))
+        units = (mn / md) / (ln / ld)
+        return int(round(units)) if abs(units - round(units)) < 1e-6 else None
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def rebar_lines(lines: list[str], factor: int, units_per_bar: int) -> list[str]:
+    """Merge `factor` consecutive bars into one (e.g. 2/4 → 4/4). Multi-bar
+    rests (Z4) are expanded first; a merged whole-bar rest becomes z<units>."""
+    if factor <= 1:
+        return list(lines)
+    out: list[str] = []
+    for line in lines:
+        if _HEADER_LINE_RE.match(line):
+            out.append(line)
+            continue
+        bars: list[str] = []
+        for bar in line.split("|"):
+            bar = bar.strip()
+            if not bar:
+                continue
+            m = _REST_BARS_RE.match(bar)
+            if m:
+                bars.extend(["Z"] * (int(m.group(1)) if m.group(1) else 1))
+            else:
+                bars.append(bar)
+        merged: list[str] = []
+        for i in range(0, len(bars), factor):
+            group = bars[i:i + factor]
+            while len(group) < factor:
+                group.append("Z")
+            if all(b == "Z" for b in group):
+                merged.append("Z")
+            else:
+                merged.append("".join(f"z{units_per_bar}" if b == "Z" else b for b in group))
+        out.append("|".join(merged) + "|")
+    return out
+
+
+# ---- ABC transposition (hook splicing into a plan in another key) -----------
+
+_LETTER_PC = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+_PC_LETTER = {v: k for k, v in _LETTER_PC.items()}
+_SHARP_ORDER = ["F", "C", "G", "D", "A", "E", "B"]
+_FLAT_ORDER = ["B", "E", "A", "D", "G", "C", "F"]
+_MAJOR_SHARPS = {0: 0, 7: 1, 2: 2, 9: 3, 4: 4, 11: 5, 6: 6, 1: 7}
+_MAJOR_FLATS = {5: 1, 10: 2, 3: 3, 8: 4, 1: 5, 6: 6, 11: 7}
+_NOTE_TOKEN_RE = re.compile(r"([_^=]*)([A-Ga-g])([,']*)")
+_CHORD_ROOT_RE = re.compile(r"(?<![A-Za-z])([A-G])([#b]?)")
+
+
+def parse_key(k: Optional[str]) -> Optional[tuple[int, bool, bool]]:
+    """"F" / "Dm" / "F#min" / "Bb" → (tonic pitch class, is_minor, spelled_with_flats)."""
+    if not k:
+        return None
+    m = re.match(r"^\s*([A-Ga-g])([#b]?)\s*([A-Za-z]*)", k.strip())
+    if not m:
+        return None
+    pc = _LETTER_PC[m.group(1).upper()] + (1 if m.group(2) == "#" else -1 if m.group(2) == "b" else 0)
+    mode = m.group(3).lower()
+    minor = mode in ("m", "min", "minor")
+    return pc % 12, minor, m.group(2) == "b"
+
+
+def key_signature(pc: int, minor: bool, prefer_flats: bool) -> dict[str, int]:
+    """Letter → accidental (+1 sharp, -1 flat, 0) implied by the key."""
+    major_pc = (pc + 3) % 12 if minor else pc
+    sharps = _MAJOR_SHARPS.get(major_pc)
+    flats = _MAJOR_FLATS.get(major_pc)
+    if sharps is not None and flats is not None:      # F#/Gb, C#/Db, B/Cb
+        use_flats = prefer_flats
+    else:
+        use_flats = flats is not None
+    sig = {L: 0 for L in _LETTER_PC}
+    if use_flats:
+        for L in _FLAT_ORDER[: flats or 0]:
+            sig[L] = -1
+    else:
+        for L in _SHARP_ORDER[: sharps or 0]:
+            sig[L] = 1
+    return sig
+
+
+def _spell(pitch: int, sig: dict[str, int], prefer_flats: bool) -> str:
+    """Absolute pitch (C4 = 48) → ABC note text under a key signature: bare
+    when the signature already gives that pitch, else an explicit accidental."""
+    octave, pc = divmod(pitch, 12)
+    for L, lpc in _LETTER_PC.items():
+        if (lpc + sig[L]) % 12 == pc:
+            acc = ""
+            break
+    else:
+        if prefer_flats:
+            L = _PC_LETTER[(pc + 1) % 12] if (pc + 1) % 12 in _PC_LETTER else _PC_LETTER[pc]
+            natural = _LETTER_PC[L]
+        else:
+            L = _PC_LETTER[(pc - 1) % 12] if (pc - 1) % 12 in _PC_LETTER else _PC_LETTER[pc]
+            natural = _LETTER_PC[L]
+        diff = (pc - natural) % 12
+        diff = diff - 12 if diff > 6 else diff
+        acc = {0: "=", 1: "^", 2: "^^", -1: "_", -2: "__"}.get(diff, "=")
+    letter = L if octave <= 4 else L.lower()
+    marks = "," * (4 - octave) if octave < 4 else "'" * (octave - 5) if octave > 5 else ""
+    return f"{acc}{letter}{marks}"
+
+
+def _prefers_flats(key: tuple[int, bool, bool]) -> bool:
+    """Spell new accidentals with flats in flat keys (Bb, Eb, Gm…), sharps
+    otherwise — judged on the key's MAJOR equivalent and how the tonic is written."""
+    pc, minor, spelled_flat = key
+    major_pc = (pc + 3) % 12 if minor else pc
+    if spelled_flat:
+        return True
+    if major_pc in _MAJOR_SHARPS and major_pc in _MAJOR_FLATS:
+        return False       # F#/Gb, C#/Db, B/Cb written without a flat → sharps
+    return major_pc in _MAJOR_FLATS and major_pc not in _MAJOR_SHARPS
+
+
+def transpose_lines(lines: list[str], semitones: int, src_key: str, dst_key: str) -> list[str]:
+    """Shift every note (and chord root) in ABC music lines by `semitones`,
+    reading bare notes under the SOURCE key signature and re-spelling them
+    under the DESTINATION one. Header lines pass through. Per-bar accidental
+    carry-over is ignored (both writers spell accidentals explicitly)."""
+    sk, dk = parse_key(src_key), parse_key(dst_key)
+    if not sk or not dk or semitones % 12 == 0 and semitones == 0:
+        return list(lines)
+    src_sig = key_signature(*sk)
+    dst_sig = key_signature(*dk)
+    prefer_flats = _prefers_flats(dk)
+
+    def note_repl(m: re.Match) -> str:
+        acc, letter, marks = m.group(1), m.group(2), m.group(3)
+        octave = 4 if letter.isupper() else 5
+        octave += marks.count("'") - marks.count(",")
+        L = letter.upper()
+        accidental = {"": src_sig[L], "=": 0, "^": 1, "^^": 2, "_": -1, "__": -2}.get(acc, src_sig[L])
+        pitch = octave * 12 + _LETTER_PC[L] + accidental
+        return _spell(pitch + semitones, dst_sig, prefer_flats)
+
+    def chord_repl(m: re.Match) -> str:
+        pc = (_LETTER_PC[m.group(1)] + (1 if m.group(2) == "#" else -1 if m.group(2) == "b" else 0) + semitones) % 12
+        if pc in _PC_LETTER:
+            return _PC_LETTER[pc]
+        return (_PC_LETTER[(pc + 1) % 12] + "b") if prefer_flats else (_PC_LETTER[(pc - 1) % 12] + "#")
+
+    out: list[str] = []
+    for line in lines:
+        if _HEADER_LINE_RE.match(line):
+            out.append(line)
+            continue
+        parts = re.split(r'("[^"]*")', line)   # keep chord strings separate from notes
+        for i, part in enumerate(parts):
+            if part.startswith('"') and part.endswith('"'):
+                parts[i] = '"' + _CHORD_ROOT_RE.sub(chord_repl, part[1:-1]) + '"'
+            else:
+                parts[i] = _NOTE_TOKEN_RE.sub(note_repl, part)
+        out.append("".join(parts))
+    return out
+
+
+def hook_shift(plan_key: str, hook_key: str) -> Optional[int]:
+    """Semitones to move the hook into the plan's tonal centre: tonic to tonic
+    when the modes agree, else to the plan's relative major/minor (a major
+    chorus over a minor plan lands on the relative major). None = unreadable."""
+    pk, hk = parse_key(plan_key), parse_key(hook_key)
+    if not pk or not hk:
+        return None
+    target = pk[0]
+    if pk[1] != hk[1]:
+        target = (pk[0] + 3) % 12 if pk[1] else (pk[0] - 3) % 12
+    shift = (target - hk[0]) % 12
+    return shift - 12 if shift > 6 else shift
+
+
+_DUR_TOKEN_RE = re.compile(r"([A-Ga-gz][,']*)(\d*)(/(\d*))?")
+
+
+def _parse_unit(unit: Optional[str]) -> Optional["Fraction"]:
+    from fractions import Fraction
+    try:
+        n, d = (int(x) for x in (unit or "1/8").split("/"))
+        return Fraction(n, d)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def rescale_durations(lines: list[str], ratio: "Fraction") -> list[str]:
+    """Re-express note/rest durations written against one L: unit in another
+    (hook L:1/32 into a plan at L:1/16 → every duration halves; odd ones
+    become n/2). Multi-bar rests (Z) and header lines are untouched."""
+    from fractions import Fraction
+    if ratio == 1:
+        return list(lines)
+
+    def repl(m: re.Match) -> str:
+        head, num, slash, den = m.group(1), m.group(2), m.group(3), m.group(4)
+        d = Fraction(int(num) if num else 1)
+        if slash is not None:
+            d /= Fraction(int(den) if den else 2)
+        d *= ratio
+        if d == 1:
+            return head
+        if d.denominator == 1:
+            return f"{head}{d.numerator}"
+        return f"{head}{d.numerator if d.numerator != 1 else ''}/{d.denominator}"
+
+    out: list[str] = []
+    for line in lines:
+        if _HEADER_LINE_RE.match(line):
+            out.append(line)
+            continue
+        parts = re.split(r'("[^"]*")', line)   # chord names are not durations
+        out.append("".join(p if p.startswith('"') else _DUR_TOKEN_RE.sub(repl, p) for p in parts))
+    return out
+
+
+def _is_label(label: str, wanted: tuple[str, ...]) -> bool:
+    low = label.lower()
+    return any(w in low for w in wanted) and not ("pre" in low and "chorus" in low and "pre-chorus" not in wanted)
+
+
+def splice_hook(plan_abc: str, hook_abc: str, labels: tuple[str, ...] = ("chorus",)) -> tuple[str, dict[str, Any]]:
+    """Replace the PLAN's `labels` sections with the HOOK's (cycling when the
+    hook has fewer). Requires the same key and note unit; a 2/4 hook is
+    re-barred into a 4/4 plan. Returns (abc, info) — on any mismatch the
+    plan comes back untouched with info["spliced"] False and a reason."""
+    ph, ps = parse_abc(plan_abc)
+    hh, hs = parse_abc(hook_abc)
+    info: dict[str, Any] = {"spliced": False, "labels": list(labels)}
+    pk, hk = abc_header_value(ph, "K"), abc_header_value(hh, "K")
+    shift = 0
+    if pk and hk and pk.replace(" ", "") != hk.replace(" ", ""):
+        # YuE2 rarely honours a key named in the style line, so the hook is
+        # transposed into the plan's tonal centre instead of refusing.
+        s_ = hook_shift(pk, hk)
+        if s_ is None:
+            info["reason"] = f"unreadable key (plan K:{pk}, hook K:{hk})"
+            return plan_abc, info
+        shift = s_
+    pl, hl = abc_header_value(ph, "L") or "1/32", abc_header_value(hh, "L") or "1/32"
+    unit_ratio = None
+    if pl != hl:
+        pu_, hu_ = _parse_unit(pl), _parse_unit(hl)
+        if not pu_ or not hu_:
+            info["reason"] = f"unreadable note unit (plan L:{pl}, hook L:{hl})"
+            return plan_abc, info
+        unit_ratio = hu_ / pu_          # hook durations → plan units (1/32 → 1/16 halves them)
+    pm, hm = abc_header_value(ph, "M") or "4/4", abc_header_value(hh, "M") or "4/4"
+    factor = 1
+    if pm != hm:
+        pu, hu = _units_per_bar(pm, pl), _units_per_bar(hm, pl)   # both in PLAN units
+        if pu and hu and pu % hu == 0:
+            factor = pu // hu
+        else:
+            info["reason"] = f"meter mismatch (plan M:{pm}, hook M:{hm})"
+            return plan_abc, info
+    hook_secs = [lines for label, lines in hs if label and _is_label(label, labels)]
+    plan_idx = [i for i, (label, _) in enumerate(ps) if label and _is_label(label, labels)]
+    if not hook_secs:
+        info["reason"] = f"the source has no {'/'.join(labels)} section"
+        return plan_abc, info
+    if not plan_idx:
+        info["reason"] = f"the planned song has no {'/'.join(labels)} section — tag one in the lyrics"
+        return plan_abc, info
+    plan_has_chords = any(_CHORD_RE.search(l) for _, lines in ps for l in lines)
+    hook_units = _units_per_bar(hm, pl) or 16      # a hook bar, in plan units
+    new_sections = list(ps)
+    for n, i in enumerate(plan_idx):
+        lines = hook_secs[n % len(hook_secs)]
+        if not plan_has_chords:
+            lines = [_CHORD_RE.sub("", l) for l in lines]
+        if shift:
+            lines = transpose_lines(lines, shift, hk or "", pk or "")
+        if unit_ratio is not None:
+            lines = rescale_durations(lines, unit_ratio)
+        lines = rebar_lines(lines, factor, hook_units)
+        new_sections[i] = (ps[i][0], lines)
+    info.update(spliced=True, replaced=len(plan_idx), hook_sections=len(hook_secs), rebar=factor,
+                chords_stripped=not plan_has_chords, transposed=shift,
+                unit_rescaled=str(unit_ratio) if unit_ratio is not None else None,
+                **({"plan_key": pk, "hook_key": hk} if shift else {}))
+    return render_abc(ph, new_sections), info
+
+
+def normalize_hook(hook_abc: Optional[str], sections: Any) -> Optional[dict[str, Any]]:
+    abc = normalize_abc(hook_abc)
+    if abc is None:
+        return None
+    labels = [str(x).strip().lower() for x in (sections or []) if str(x).strip()] or ["chorus"]
+    return {"abc": abc, "sections": labels[:8]}
 
 
 def normalize_long(long: Any) -> Optional[dict[str, Any]]:
@@ -481,6 +851,8 @@ class Job:
     # per-chunk facts once rendered.
     chunk_span: tuple[float, float] = (0.0, 1.0)
     chunks: list[dict[str, Any]] = field(default_factory=list)
+    # Hook riff: what the splice did (spliced / replaced / rebar, or a reason).
+    hook: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -496,6 +868,7 @@ class Job:
             "request": {k: v for k, v in self.request.items() if k not in ("lyrics", "abc")},
             "cover": self.request.get("abc") is not None,
             "long": self.request.get("long") is not None, "chunks": self.chunks,
+            "hook": self.hook,
         }
 
 
@@ -651,7 +1024,7 @@ class Runner:
     def _run(self, job: Job) -> None:
         from yue2.protocol import SongRequest
         pipe = self.ensure_loaded(job)
-        base = {k: v for k, v in job.request.items() if k != "long"}
+        base = {k: v for k, v in job.request.items() if k not in ("long", "hook")}
         long = job.request.get("long")
         lyric_chunks = (plan_chunks(split_sections(base["lyrics"]), long["max_lines_per_chunk"], long["overlap_chorus"])
                         if long else [base["lyrics"]])
@@ -712,6 +1085,19 @@ class Runner:
                          on_token=on_token(PLAN_MAX_TOKENS, "plan") if request.cot != "off" else None)
         if cancelled():
             raise InterruptedError("cancelled after plan")
+        hook = job.request.get("hook")
+        if hook and request.abc is None and getattr(plan, "abc", None):
+            # Hook riff: keep the fresh plan's verses, drop in the source's
+            # chorus bars, then re-plan from the spliced score (YuE2 just
+            # tokenizes a provided ABC).
+            import dataclasses
+            spliced, info = splice_hook(plan.abc, hook["abc"], tuple(hook["sections"]))
+            self._set(job, hook=info)
+            if info.get("spliced"):
+                request = dataclasses.replace(request, abc=spliced)
+                plan = pipe.plan(request=request, cancelled=cancelled)
+            else:
+                log.warning("hook not spliced for job %s: %s", job.id, info.get("reason"))
         job.timing["plan_seconds"] = round(job.timing.get("plan_seconds", 0.0) + time.time() - t, 2)
 
         t = time.time()
@@ -811,6 +1197,10 @@ class GenerateRequest(BaseModel):
     # trim_start_s, trim_end_s}. Lyrics are chunked on [Section] blocks and
     # the chunk songs are crossfaded together (see LONG_* constants).
     long: Optional[Any] = None
+    # Hook riff: the SOURCE score whose `hook_sections` (default chorus) are
+    # spliced into a freshly planned song — new verses, the original hook.
+    hook_abc: Optional[str] = None
+    hook_sections: Optional[list[str]] = None
 
 
 def _gpu_info() -> dict[str, Any]:
@@ -844,7 +1234,7 @@ async def healthz() -> dict[str, Any]:
 async def generate(req: GenerateRequest) -> dict[str, Any]:
     try:
         request = build_request(req.style, req.lyrics, req.cot, req.seed, req.cfg_scale, req.id,
-                                abc=req.abc, long=req.long)
+                                abc=req.abc, long=req.long, hook_abc=req.hook_abc, hook_sections=req.hook_sections)
         job, position = runner.submit(request)
     except BadRequest as exc:
         raise HTTPException(400, str(exc))

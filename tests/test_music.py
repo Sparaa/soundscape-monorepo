@@ -492,3 +492,183 @@ def test_long_progress_stays_within_chunk_spans(client):
         time.sleep(0.01)
     assert seen == sorted(seen), "progress must never go backwards across chunks"
     assert seen[-1] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# cover riffs (2026-09-13): ABC sections + hook splicing
+# --------------------------------------------------------------------------- #
+
+PLAN_44 = """X:1
+T:
+M:4/4
+L:1/32
+Q:1/4=92
+V: Vocal clef=treble name="Vocal Melody" snm="Vocal"
+V: Ins clef=treble name="Ins Melody" snm="Inst."
+K:F
+% verse
+V: Vocal
+"F"z8c4c2f2f4e2d4c4A2|"Dm"A6G4z6z16|
+V: Ins
+Z2|
+% chorus
+V: Vocal
+"F"PLAN-CHORUS-VOCAL|"Bb"z32|
+V: Ins
+PLAN-CHORUS-INS|Z|
+% outro
+V: Vocal
+"F"z32|
+V: Ins
+Z|
+"""
+
+HOOK_24 = """X:1
+T:
+M:2/4
+L:1/32
+Q:1/4=92
+V: Vocal clef=treble name="Vocal Melody" snm="Vocal"
+V: Ins clef=treble name="Ins Melody" snm="Inst."
+K:F
+% intro
+V: Vocal
+Z4|
+V: Ins
+Z|F4A4z2F2A2f2|Z2|
+% chorus
+V: Vocal
+"F"g12a2g2-|"Bb"g6f6e4|d8c8|B8z8|Z2|
+V: Ins
+Z4|
+"""
+
+
+def test_parse_render_roundtrip_and_strip_chords():
+    h, secs = m.parse_abc(PLAN_44)
+    assert h[0] == "X:1" and h[-1] == "K:F" and any(x.startswith("V: Vocal clef=") for x in h)
+    assert [label for label, _ in secs] == ["verse", "chorus", "outro"]
+    assert m.render_abc(h, secs) == PLAN_44
+    assert m.abc_header_value(h, "M") == "4/4" and m.abc_header_value(h, "Q") == "1/4=92"
+    stripped = m.strip_chords(PLAN_44)
+    assert '"F"' not in stripped.split("K:F")[1] and 'name="Vocal Melody"' in stripped   # voice names survive
+
+
+def test_rebar_merges_2_4_bars_into_4_4():
+    lines = m.rebar_lines(['g12a2g2-|g6f6e4|d8c8|B8z8|Z2|', "Z4|", "V: Ins"], factor=2, units_per_bar=16)
+    assert lines == ["g12a2g2-g6f6e4|d8c8B8z8|Z|", "Z|Z|", "V: Ins"]
+    # an odd bar count pads the last merged bar with a half-bar rest
+    assert m.rebar_lines(["A16|B16|C16|"], 2, 16) == ["A16B16|C16z16|"]
+    assert m.rebar_lines(["A16|B16|"], 1, 16) == ["A16|B16|"]
+
+
+def test_splice_hook_replaces_chorus_and_rebars():
+    abc, info = m.splice_hook(PLAN_44, HOOK_24)
+    assert info["spliced"] is True and info["replaced"] == 1 and info["rebar"] == 2 and info["chords_stripped"] is False
+    h, secs = m.parse_abc(abc)
+    assert [label for label, _ in secs] == ["verse", "chorus", "outro"]
+    chorus = dict(secs)["chorus"]
+    assert "PLAN-CHORUS" not in "".join(chorus)
+    assert chorus[1] == '"F"g12a2g2-"Bb"g6f6e4|d8c8B8z8|Z|'      # hook bars, 2/4 pairs merged into 4/4, chords kept
+    assert dict(secs)["verse"] == dict(m.parse_abc(PLAN_44)[1])["verse"]   # verses untouched
+    # a melody-only plan drops the hook's chords
+    abc2, info2 = m.splice_hook(m.strip_chords(PLAN_44), HOOK_24)
+    assert info2["chords_stripped"] is True and '"Bb"' not in abc2.split("K:F")[1]
+
+
+def test_key_parsing_signatures_and_hook_shift():
+    assert m.parse_key("F") == (5, False, False) and m.parse_key("D#m") == (3, True, False) and m.parse_key("Bb") == (10, False, True)
+    assert m.key_signature(5, False, False) == {"C": 0, "D": 0, "E": 0, "F": 0, "G": 0, "A": 0, "B": -1}      # F major: Bb
+    assert m.key_signature(6, False, False)["F"] == 1 and m.key_signature(6, False, False)["E"] == 1        # F# major: 6 sharps
+    assert m.key_signature(3, True, False) == m.key_signature(6, False, False)                               # D#m = relative of F#
+    assert m.hook_shift("F", "F") == 0 and m.hook_shift("G", "F") == 2 and m.hook_shift("C", "F") == -5
+    assert m.hook_shift("D#m", "F") == 1        # major hook over a minor plan → the plan's relative major (F#)
+    assert m.hook_shift("F", "Dm") == 0         # minor hook over a major plan → its relative minor (Dm) — already there
+    assert m.hook_shift("Am", "Dm") == -5
+
+
+def test_transpose_lines_respells_under_the_new_signature():
+    # In K:F a bare B is Bb; +1 semitone into K:F# it becomes B natural = bare B there. c → c# = bare c in F#.
+    out = m.transpose_lines(['"F"c2B2A2|"Bb"F4z4|', "V: Vocal", "Z4|"], 1, "F", "F#")
+    assert out == ['"F#"c2B2A2|"B"F4z4|', "V: Vocal", "Z4|"]
+    # Down a fifth into C: F→C, bare B(b)→F, A→E, "Bb"→"F"; rests/durations untouched
+    assert m.transpose_lines(['"F"c2B2A2|"Bb"F4z4|'], -5, "F", "C") == ['"C"G2F2E2|"F"C4z4|']
+    # Explicit accidentals and octave marks survive: ^c (C#5) +2 → D#5 = bare d in K:E (D# in its signature);
+    # C,3 +2 → D natural, which E major must write as =D,
+    assert m.transpose_lines(["^c2C,2"], 2, "C", "E") == ["d2=D,2"]
+    assert m._prefers_flats(m.parse_key("D#m")) is False and m._prefers_flats(m.parse_key("Gm")) is True and m._prefers_flats(m.parse_key("Bb")) is True
+    assert m.transpose_lines(["c2"], 0, "F", "F") == ["c2"]
+
+
+def test_splice_hook_transposes_a_hook_in_another_key():
+    abc, info = m.splice_hook(PLAN_44.replace("K:F", "K:D#m"), HOOK_24)
+    assert info["spliced"] is True and info["transposed"] == 1 and info["plan_key"] == "D#m" and info["hook_key"] == "F"
+    chorus = dict(m.parse_abc(abc)[1])["chorus"]
+    assert chorus[1].startswith('"F#"') and '"B"' in chorus[1]            # F→F#, Bb→B, hook bars re-barred 2/4→4/4
+
+
+def test_rescale_durations_between_note_units():
+    from fractions import Fraction
+    # L:1/32 hook into an L:1/16 plan: halve every duration; odd ones become n/2, 1 becomes /2
+    out = m.rescale_durations(['"F"g12a2g2-|d8c8|B8z8|Z2|', "A1B3c|", "V: Vocal"], Fraction(1, 2))
+    assert out == ['"F"g6ag-|d4c4|B4z4|Z2|', "A/2B3/2c/2|", "V: Vocal"]
+    assert m.rescale_durations(["A/2B3/2|"], Fraction(2)) == ["AB3|"]
+    assert m.rescale_durations(["A8|"], Fraction(1)) == ["A8|"]
+
+
+def test_splice_hook_rescales_units_and_transposes_together():
+    plan = PLAN_44.replace("L:1/32", "L:1/16").replace("K:F", "K:D#m")
+    abc, info = m.splice_hook(plan, HOOK_24)
+    assert info["spliced"] is True and info["unit_rescaled"] == "1/2" and info["transposed"] == 1 and info["rebar"] == 2
+    chorus = dict(m.parse_abc(abc)[1])["chorus"]
+    # F→F# (Bb→B), 32nd durations halved, 2/4 pairs merged into 4/4 bars of 8 plan units
+    assert chorus[1] == '"F#"g6ag-"B"g3f3e2|d4c4B4z4|Z|'
+
+
+def test_splice_hook_refuses_mismatches():
+    _, info = m.splice_hook(PLAN_44, HOOK_24.replace("K:F", "K:Xq"))
+    assert info["spliced"] is False and "unreadable key" in info["reason"]
+    _, info = m.splice_hook(PLAN_44.replace("M:4/4", "M:2/4"), HOOK_24.replace("M:2/4", "M:4/4"))
+    assert "meter mismatch" in info["reason"]
+    _, info = m.splice_hook(PLAN_44, HOOK_24.replace("% chorus", "% bridge"))
+    assert "no chorus section" in info["reason"]
+    _, info = m.splice_hook(PLAN_44.replace("% chorus", "% verse 2"), HOOK_24)
+    assert "planned song has no chorus" in info["reason"]
+    _, info = m.splice_hook(PLAN_44, HOOK_24.replace("L:1/32", "L:x"))
+    assert "unreadable note unit" in info["reason"]
+
+
+def test_build_request_hook_validation():
+    req = m.build_request("pop", "[Chorus]\nhey", seed=1, hook_abc=HOOK_24, hook_sections=["Chorus", ""])
+    assert req["hook"] == {"abc": HOOK_24, "sections": ["chorus"]} and "abc" not in req
+    assert m.build_request("pop", "hi", seed=1, hook_abc=HOOK_24)["hook"]["sections"] == ["chorus"]
+    for kw in (dict(cot="off"), dict(abc="K:F\n|F|", cot="melody"), dict(long=True)):
+        with pytest.raises(m.BadRequest):
+            m.build_request("pop", "hi", seed=1, hook_abc=HOOK_24, **kw)
+
+
+def test_hook_lifecycle_splices_then_replans(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "SCRATCH_DIR", str(tmp_path))
+    pipe = FakePipe(abc=PLAN_44)
+    plans = []
+    real_plan = pipe.plan
+
+    def plan(request, cancelled=None, on_token=None, **_):
+        plans.append(request.abc)
+        if request.abc is not None:
+            return _Plan(request, request.abc)   # a provided score is tokenized, not sampled
+        return real_plan(request, cancelled=cancelled, on_token=on_token)
+
+    pipe.plan = plan
+    runner = m.Runner(factory=lambda: pipe)
+    monkeypatch.setattr(m, "runner", runner)
+    with TestClient(m.app) as c:
+        r = c.post("/generate", json={"style": "English, pop", "lyrics": "[Verse]\nla\n\n[Chorus]\nhey", "seed": 5,
+                                      "hook_abc": HOOK_24, "hook_sections": ["chorus"]})
+        assert r.status_code == 200
+        done = _wait(c, r.json()["job_id"])
+        assert done["state"] == "done" and done["hook"]["spliced"] is True and done["hook"]["rebar"] == 2
+        assert plans[0] is None and plans[1] is not None                     # fresh plan, then the spliced score
+        score = c.get(f"/jobs/{done['job_id']}/score").text
+        assert "g12a2g2-" in score and "PLAN-CHORUS" not in score and "% verse" in score
+    runner.stop()
