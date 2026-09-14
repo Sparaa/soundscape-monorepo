@@ -45,12 +45,21 @@ MAX_AUDIO_MB = float(os.environ.get("SHEETSAGE_MAX_AUDIO_MB", "80"))
 # length; a 15-minute upload is a mistake, not a song).
 MAX_SECONDS = float(os.environ.get("SHEETSAGE_MAX_SECONDS", "900"))
 SWEEP_SEC = float(os.environ.get("SHEETSAGE_SWEEP_SEC", "30"))
+# Sound tagger (2026-09-13): CLAP zero-shot over curated vocabularies turns the
+# SOURCE recording into a YuE2 style line (genre, mood, instruments, vocal,
+# production) — the one thing a score cannot carry. Faithful covers pre-fill
+# their Style with it instead of the writer inventing a genre.
+TAG_MODEL = os.environ.get("SHEETSAGE_TAG_MODEL", "laion/larger_clap_music_and_speech")
+TAG_ENABLED = os.environ.get("SHEETSAGE_TAG_ENABLED", "1") == "1"
+TAG_SAMPLE_RATE = 48000       # CLAP's feature extractor rate
+TAG_WINDOW_S = 10.0           # CLAP's training clip length
+TAG_MAX_WINDOWS = 12
 
 # Stage -> (start, end) share of the progress bar. "encoding" advances per
 # 300 s window; decoding/ABC assembly is short and untimed.
 STAGE_SPAN = {
     "queued": (0.0, 0.0), "loading": (0.0, 0.10), "decoding": (0.10, 0.15),
-    "encoding": (0.15, 0.90), "scoring": (0.90, 0.99), "done": (1.0, 1.0),
+    "encoding": (0.15, 0.85), "scoring": (0.85, 0.90), "tagging": (0.90, 0.99), "done": (1.0, 1.0),
 }
 
 app = FastAPI(title="vidmakr-sheetsage", docs_url=None, redoc_url=None)
@@ -135,6 +144,102 @@ def abc_summary(abc: Optional[str]) -> dict[str, Any]:
     return {"bars": bars, "voices": max(1, len(voices)), "sections": sections, "key": key, "bpm": bpm}
 
 
+# ---- sound tagging vocabularies + composition (pure) -------------------------
+
+TAG_VOCAB: dict[str, tuple[tuple[str, ...], list[str]]] = {
+    # category: (prompt templates — ensembled by averaging their text
+    # embeddings, the standard CLIP/CLAP trick against template artifacts —
+    # and the labels). Phrasings and label sets were chosen on two known
+    # recordings (2026-09-13 eval, docs/music-plan.md): single-template genre
+    # flipped between dream pop / k-pop / indie folk; "duet" and "rap vocals"
+    # labels acted as attractors, so vocal type is female / male / rapping /
+    # instrumental only; "the sound of X" hears the guitar family right.
+    "genre": (("{} music", "a {} track", "a {} song", "This is {} music.", "the genre of this song is {}"), [
+        "pop", "rock", "indie rock", "indie folk", "folk", "country", "blues", "jazz", "soul", "R&B", "funk", "disco",
+        "hip hop", "trap", "reggae", "punk", "heavy metal", "hard rock", "grunge", "alternative rock", "synthwave",
+        "synth-pop", "EDM", "house", "techno", "trance", "drum and bass", "dubstep", "ambient", "lo-fi hip hop",
+        "classical", "orchestral film score", "musical theatre", "gospel", "latin pop", "reggaeton", "bossa nova",
+        "flamenco", "k-pop", "city pop", "chiptune", "shoegaze", "dream pop", "post-rock", "acoustic singer-songwriter",
+        "bluegrass", "americana", "sea shanty", "children's music",
+    ]),
+    "mood": (("a {} song", "{} music"), [
+        "happy", "sad", "melancholic", "dark", "energetic", "calm", "romantic", "dreamy", "aggressive", "nostalgic",
+        "hopeful", "tense", "playful", "epic", "wistful", "intimate",
+    ]),
+    "instruments": (("the sound of {}", "a song featuring {}"), [
+        "acoustic guitar", "fingerpicked acoustic guitar", "electric guitar", "distorted electric guitar", "piano",
+        "electric piano", "synthesizer pads", "analog synth bass", "drum kit", "electronic drums", "808 drums",
+        "brushed drums", "upright bass", "bass guitar", "string section", "violin", "cello", "brass section",
+        "saxophone", "trumpet", "flute", "harmonica", "banjo", "mandolin", "ukulele", "organ", "harp", "hand claps",
+        "choir", "orchestra",
+    ]),
+    "vocal": (("{}", "a song with {}"), [
+        "female vocals", "male vocals", "rapping", "instrumental music without vocals",
+    ]),
+    "voice": (("{} vocals", "a singer with a {} voice"), [
+        "breathy soft", "powerful belting", "raspy gritty", "smooth warm", "high falsetto", "whispered", "autotuned",
+        "deep low", "airy light",
+    ]),
+    "production": (("a song with {}", "{}"), [
+        "lo-fi production", "polished modern production", "vintage 1960s production", "1970s analog warmth",
+        "1980s synth production", "1990s production", "a live concert recording", "an intimate acoustic recording",
+    ]),
+}
+# Vocal-character tags only mean something when there is a singer.
+_INSTRUMENTAL = "instrumental music without vocals"
+
+
+def pick_tags(scores: dict[str, list[float]], top: dict[str, int] | None = None,
+              min_prob: dict[str, float] | None = None) -> dict[str, list[tuple[str, float]]]:
+    """Per category: softmax over the label scores, keep the top-k above a
+    floor. scores = {category: [logit per label in TAG_VOCAB order]}."""
+    import math
+    top = top or {"genre": 2, "mood": 2, "instruments": 4, "vocal": 1, "voice": 1, "production": 1}
+    min_prob = min_prob or {"genre": 0.12, "mood": 0.15, "instruments": 0.06, "vocal": 0.30, "voice": 0.18, "production": 0.25}
+    out: dict[str, list[tuple[str, float]]] = {}
+    for cat, (_, labels) in TAG_VOCAB.items():
+        vals = scores.get(cat)
+        if not vals or len(vals) != len(labels):
+            continue
+        mx = max(vals)
+        exps = [math.exp(v - mx) for v in vals]
+        z = sum(exps) or 1.0
+        probs = sorted(((labels[i], e / z) for i, e in enumerate(exps)), key=lambda t: -t[1])
+        keep = [(l, round(p, 3)) for l, p in probs[: top.get(cat, 1)] if p >= min_prob.get(cat, 0.0)]
+        if not keep and probs:
+            keep = [(probs[0][0], round(probs[0][1], 3))]   # the best guess is still a guess worth showing
+        out[cat] = keep
+    return out
+
+
+def compose_style(tags: dict[str, list[tuple[str, float]]], *, language: str = "English",
+                  bpm: Optional[int] = None) -> str:
+    """YuE2 style line in its guide's order: language, genre, mood,
+    instruments, vocal character, tempo."""
+    parts = [language.strip() or "English"]
+    genre = [l for l, _ in tags.get("genre", [])]
+    if genre:
+        parts.append(genre[0] if len(genre) == 1 or tags["genre"][1][1] < 0.25 * tags["genre"][0][1] else f"{genre[0]} with {genre[1]} touches")
+    parts += [l for l, _ in tags.get("mood", [])][:2]
+    parts += [l for l, _ in tags.get("instruments", [])][:4]
+    vocal = tags.get("vocal", [])
+    if vocal and vocal[0][0] == _INSTRUMENTAL:
+        parts.append("instrumental, no vocals")
+    elif vocal:
+        who = vocal[0][0]                      # "female vocals"
+        voice = tags.get("voice", [])          # "breathy soft"
+        parts.append(f"{voice[0][0]} {who}" if voice else who)
+    prod = [l for l, _ in tags.get("production", [])]
+    if prod:
+        parts.append(prod[0])
+    if bpm:
+        parts.append(f"{bpm} BPM")
+    # de-duplicate while keeping order
+    seen: set[str] = set()
+    uniq = [p for p in parts if not (p.lower() in seen or seen.add(p.lower()))]
+    return ", ".join(uniq)
+
+
 def stage_progress(stage: str, frac: float) -> float:
     lo, hi = STAGE_SPAN.get(stage, (0.0, 1.0))
     return round(lo + (hi - lo) * max(0.0, min(1.0, frac)), 4)
@@ -173,6 +278,13 @@ class Job:
     warnings: list[str] = field(default_factory=list)
     midi: Optional[bytes] = None
     seconds: Optional[float] = None
+    # Sound description of the SOURCE (CLAP zero-shot): tag probabilities per
+    # category and the composed YuE2 style line — what a faithful cover's
+    # Style box should start from.
+    tags: Optional[dict[str, Any]] = None
+    style_guess: Optional[str] = None
+    language: str = "English"
+    describe: bool = True
     error: Optional[str] = None
     timing: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
@@ -195,16 +307,94 @@ class Job:
             "has_midi": self.midi is not None, "error": self.error, "timing": self.timing,
             "key": summary.get("key"), "bpm": summary.get("bpm"), "bars": summary.get("bars"),
             "sections": summary.get("sections", []),
+            "tags": self.tags, "style_guess": self.style_guess,
             "created_at": self.created_at, "started_at": self.started_at, "finished_at": self.finished_at,
         }
+
+
+class Tagger:
+    """CLAP zero-shot sound description. describe(audio bytes) → (tags, style)."""
+
+    def __init__(self) -> None:
+        self.model: Any = None
+        self.processor: Any = None
+        self.device = "cpu"
+        self._text: dict[str, Any] = {}
+
+    def load(self) -> None:
+        if self.model is not None:
+            return
+        import torch
+        from transformers import ClapModel, ClapProcessor
+        t = time.time()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = ClapProcessor.from_pretrained(TAG_MODEL, local_files_only=LOCAL_FILES_ONLY)
+        self.model = ClapModel.from_pretrained(TAG_MODEL, local_files_only=LOCAL_FILES_ONLY).eval().to(self.device)
+        with torch.no_grad():
+            for cat, (templates, labels) in TAG_VOCAB.items():
+                per_template = []
+                for template in templates:
+                    inputs = self.processor(text=[template.format(l) for l in labels], return_tensors="pt", padding=True).to(self.device)
+                    emb = self.model.get_text_features(**inputs)
+                    per_template.append(emb / emb.norm(dim=-1, keepdim=True))
+                ens = torch.stack(per_template).mean(dim=0)
+                self._text[cat] = ens / ens.norm(dim=-1, keepdim=True)
+        log.info("CLAP tagger loaded on %s in %.1fs", self.device, time.time() - t)
+
+    def unload(self) -> None:
+        self.model = self.processor = None
+        self._text = {}
+
+    @staticmethod
+    def _decode(audio: bytes) -> "np.ndarray":
+        import numpy as np
+        r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", "pipe:0", "-vn", "-ac", "1",
+                            "-ar", str(TAG_SAMPLE_RATE), "-f", "f32le", "pipe:1"],
+                           input=audio, capture_output=True, timeout=600, check=False)
+        if r.returncode:
+            raise ValueError("cannot decode audio for tagging: " + r.stderr.decode(errors="replace")[-300:])
+        return np.frombuffer(r.stdout, dtype="<f4").copy()
+
+    @staticmethod
+    def windows(n_samples: int, sr: int = TAG_SAMPLE_RATE, window_s: float = TAG_WINDOW_S,
+                max_windows: int = TAG_MAX_WINDOWS) -> list[tuple[int, int]]:
+        """Evenly spaced (start, end) sample spans covering the song."""
+        w = int(window_s * sr)
+        if n_samples <= w:
+            return [(0, n_samples)]
+        count = min(max_windows, max(1, n_samples // w))
+        step = (n_samples - w) / max(1, count - 1) if count > 1 else 0
+        return [(int(i * step), int(i * step) + w) for i in range(count)]
+
+    def describe(self, audio: bytes, *, language: str = "English", bpm: Optional[int] = None) -> tuple[dict[str, Any], str]:
+        import numpy as np
+        import torch
+        self.load()
+        wave = self._decode(audio)
+        clips = [wave[a:b] for a, b in self.windows(len(wave))]
+        with torch.no_grad():
+            inputs = self.processor(audios=clips, sampling_rate=TAG_SAMPLE_RATE, return_tensors="pt").to(self.device)
+            emb = self.model.get_audio_features(**inputs)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+            song = emb.mean(dim=0, keepdim=True)
+            song = song / song.norm(dim=-1, keepdim=True)
+            scale = float(self.model.logit_scale_a.exp()) if hasattr(self.model, "logit_scale_a") else 33.0
+            scores = {cat: (scale * song @ txt.T)[0].tolist() for cat, txt in self._text.items()}
+        tags = pick_tags(scores)
+        if tags.get("vocal") and tags["vocal"][0][0] == _INSTRUMENTAL:
+            tags["voice"] = []
+        public = {cat: [{"label": l, "p": p} for l, p in items] for cat, items in tags.items()}
+        return {"tags": public, "windows": len(clips)}, compose_style(tags, language=language, bpm=bpm)
 
 
 class Runner:
     """Owns the model and the single worker thread. `factory` builds the
     model (swapped for a fake in tests); `model` is None while unloaded."""
 
-    def __init__(self, factory: Optional[Callable[[], Any]] = None):
+    def __init__(self, factory: Optional[Callable[[], Any]] = None, tagger: Optional[Any] = None):
         self.factory = factory or self._load_model
+        # tagger=False disables sound tagging (tests); None = the default CLAP tagger when enabled
+        self.tagger: Any = None if tagger is False else (tagger if tagger is not None else (Tagger() if TAG_ENABLED else None))
         self.model: Any = None
         self.lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
@@ -246,9 +436,14 @@ class Runner:
 
     def unload(self) -> bool:
         with self.lock:
-            if self.model is None or self.current is not None:
+            if (self.model is None and not (self.tagger and getattr(self.tagger, "model", None) is not None)) or self.current is not None:
                 return False
             self.model = None
+            if self.tagger is not None:
+                try:
+                    self.tagger.unload()
+                except Exception:  # noqa: BLE001
+                    pass
         gc.collect()
         try:
             import torch
@@ -258,14 +453,15 @@ class Runner:
         log.info("SheetSage2 unloaded (idle)")
         return True
 
-    def submit(self, audio: bytes, name: str, melody_only: bool, max_seconds: Optional[float]) -> tuple[Job, int]:
+    def submit(self, audio: bytes, name: str, melody_only: bool, max_seconds: Optional[float],
+               language: str = "English", describe: bool = True) -> tuple[Job, int]:
         with self.lock:
             pending = sum(1 for j in self.jobs.values() if j.state == "queued")
             if pending >= MAX_QUEUE:
                 raise BadRequest(f"queue is full ({MAX_QUEUE} pending)")
             job_id = uuid.uuid4().hex[:12]
             job = Job(id=job_id, name=name, dir=Path(SCRATCH_DIR) / job_id, melody_only=melody_only,
-                      max_seconds=max_seconds)
+                      max_seconds=max_seconds, language=language or "English", describe=describe)
             position = pending + (1 if self.current is not None else 0)
             self.jobs[job_id] = job
             self.last_activity = time.time()
@@ -379,6 +575,20 @@ class Runner:
         job.timing["transcribe_seconds"] = round(time.time() - t, 2)
         if job.abc is None:
             raise RuntimeError(job.abc_error or "no ABC score was produced")
+        if job.describe and self.tagger is not None:
+            # The score says nothing about the SOUND; tag the recording so a
+            # faithful cover can start from the original's genre/voice. A
+            # tagging failure is a warning, never a failed transcription.
+            t = time.time()
+            self._set(job, stage="tagging", progress=stage_progress("tagging", 0.3))
+            try:
+                info, style = self.tagger.describe(audio, language=job.language, bpm=abc_summary(job.abc).get("bpm"))
+                self._set(job, tags=info.get("tags"), style_guess=style)
+                job.timing["tag_seconds"] = round(time.time() - t, 2)
+                job.timing["tag_windows"] = info.get("windows")
+            except Exception as exc:  # noqa: BLE001
+                log.exception("tagging failed for job %s", job.id)
+                self._set(job, warnings=[*job.warnings, f"sound tagging failed: {type(exc).__name__}: {exc}"])
 
     def _sweep(self) -> None:
         while not self._stop.wait(SWEEP_SEC):
@@ -414,6 +624,8 @@ class TranscribeRequest(BaseModel):
     name: str = ""
     melody_only: bool = True          # chord-free score, what YuE2 cover mode wants
     max_seconds: Optional[float] = None
+    language: str = "English"         # first word of the composed style line
+    describe: bool = True             # CLAP sound tags + style_guess
 
 
 def _gpu_info() -> dict[str, Any]:
@@ -431,7 +643,9 @@ def _gpu_info() -> dict[str, Any]:
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
     return {"ok": True, "loaded": runner.model is not None, "busy": runner.current,
-            "queue": runner.q.qsize(), "model": MODEL, "dtype": DTYPE, "gpu": _gpu_info()}
+            "queue": runner.q.qsize(), "model": MODEL, "dtype": DTYPE, "gpu": _gpu_info(),
+            "tagger": {"enabled": runner.tagger is not None, "model": TAG_MODEL,
+                       "loaded": bool(runner.tagger is not None and getattr(runner.tagger, "model", None) is not None)}}
 
 
 @app.post("/transcribe")
@@ -442,7 +656,8 @@ async def transcribe(req: TranscribeRequest) -> dict[str, Any]:
         if max_seconds is not None and not 0 < max_seconds <= MAX_SECONDS:
             raise BadRequest(f"max_seconds must be within (0, {MAX_SECONDS:g}]")
         job, position = runner.submit(audio, (req.name or "song")[:120], bool(req.melody_only),
-                                      max_seconds if max_seconds is not None else MAX_SECONDS)
+                                      max_seconds if max_seconds is not None else MAX_SECONDS,
+                                      language=(req.language or "English")[:40], describe=bool(req.describe))
     except BadRequest as exc:
         raise HTTPException(400, str(exc))
     return {"job_id": job.id, "state": job.state, "position": position}

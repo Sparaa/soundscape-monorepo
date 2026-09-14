@@ -42,7 +42,8 @@ def test_decode_audio_b64_caps():
 
 
 def test_stage_progress_spans():
-    assert m.stage_progress("encoding", 0.0) == 0.15 and m.stage_progress("encoding", 1.0) == 0.9
+    assert m.stage_progress("encoding", 0.0) == 0.15 and m.stage_progress("encoding", 1.0) == 0.85
+    assert m.stage_progress("tagging", 1.0) == 0.99
     assert m.stage_progress("done", 0.3) == 1.0
 
 
@@ -69,7 +70,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(m, "SCRATCH_DIR", str(tmp_path))
     monkeypatch.setattr(m, "probe_seconds", lambda path: 61.5)
     fake = FakeModel()
-    m.runner = m.Runner(factory=lambda: fake)
+    m.runner = m.Runner(factory=lambda: fake, tagger=False)   # no CLAP in the plain lifecycle tests
     m.runner.start()
     yield TestClient(m.app), fake
     m.runner.stop()
@@ -123,3 +124,107 @@ def test_transcribe_validation(client):
     assert c.post("/transcribe", json={"audio_b64": base64.b64encode(b"x" * 200).decode(), "max_seconds": 0}).status_code == 400
     assert c.post("/transcribe", json={"audio_b64": base64.b64encode(b"x" * 200).decode(), "max_seconds": m.MAX_SECONDS + 1}).status_code == 400
     assert c.get("/jobs/nope").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# sound tagging (2026-09-13): CLAP zero-shot → YuE2 style line
+# --------------------------------------------------------------------------- #
+
+def _scores(**best):
+    """Logit vectors where the named label leads its category by a wide margin."""
+    out = {}
+    for cat, (_templates, labels) in m.TAG_VOCAB.items():
+        vals = [0.0] * len(labels)
+        for i, lbl in enumerate(labels):
+            if lbl in best.get(cat, ()):
+                vals[i] = 6.0 - 0.5 * list(best[cat]).index(lbl)
+        out[cat] = vals
+    return out
+
+
+def test_pick_tags_and_compose_style():
+    tags = m.pick_tags(_scores(genre=["indie folk"], mood=["wistful", "hopeful"],
+                               instruments=["fingerpicked acoustic guitar", "brushed drums", "upright bass"],
+                               vocal=["female vocals"], voice=["breathy soft"], production=["an intimate acoustic recording"]))
+    assert tags["genre"][0][0] == "indie folk" and tags["vocal"][0][0] == "female vocals" and len(tags["vocal"]) == 1
+    assert [l for l, _ in tags["instruments"]] == ["fingerpicked acoustic guitar", "brushed drums", "upright bass"]
+    style = m.compose_style(tags, language="English", bpm=92)
+    assert style == ("English, indie folk, wistful, hopeful, fingerpicked acoustic guitar, brushed drums, upright bass, "
+                     "breathy soft female vocals, an intimate acoustic recording, 92 BPM")
+    # instrumental → no voice character; no bpm → no tempo
+    inst = m.pick_tags(_scores(genre=["ambient"], vocal=["instrumental music without vocals"], voice=["whispered"]))
+    inst["voice"] = []
+    assert m.compose_style(inst, language="Mandarin") .startswith("Mandarin, ambient") and "instrumental, no vocals" in m.compose_style(inst)
+    assert "BPM" not in m.compose_style(inst)
+    # a close second genre becomes "… with … touches"
+    close = m.pick_tags(_scores(genre=["synthwave", "synth-pop"]))
+    close["genre"] = [("synthwave", 0.5), ("synth-pop", 0.2)]
+    assert m.compose_style(close).startswith("English, synthwave with synth-pop touches")
+    close["genre"] = [("synthwave", 0.5), ("synth-pop", 0.1)]
+    assert m.compose_style(close).startswith("English, synthwave,") or m.compose_style(close) == "English, synthwave"
+    assert all(isinstance(t, tuple) and t for t, _ in m.TAG_VOCAB.values())   # every category ensembles ≥ 1 template
+
+
+def test_windows_cover_the_song_evenly():
+    sr = m.TAG_SAMPLE_RATE
+    assert m.Tagger.windows(5 * sr) == [(0, 5 * sr)]                         # shorter than one clip
+    w = m.Tagger.windows(78 * sr)
+    assert len(w) == 7 and w[0][0] == 0 and w[-1][1] == 78 * sr and all(b - a == 10 * sr for a, b in w)
+    assert len(m.Tagger.windows(600 * sr)) == m.TAG_MAX_WINDOWS
+
+
+class FakeTagger:
+    model = None
+
+    def __init__(self, fail=False):
+        self.fail, self.calls = fail, []
+
+    def describe(self, audio, *, language="English", bpm=None):
+        self.calls.append((len(audio), language, bpm))
+        if self.fail:
+            raise RuntimeError("clap exploded")
+        self.model = object()
+        return ({"tags": {"genre": [{"label": "indie folk", "p": 0.7}]}, "windows": 3},
+                m.compose_style({"genre": [("indie folk", 0.7)], "vocal": [("female vocals", 0.8)]}, language=language, bpm=bpm))
+
+    def unload(self):
+        self.model = None
+
+
+@pytest.fixture
+def tagged_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "SCRATCH_DIR", str(tmp_path))
+    monkeypatch.setattr(m, "probe_seconds", lambda path: 61.5)
+    fake, tagger = FakeModel(), FakeTagger()
+    m.runner = m.Runner(factory=lambda: fake, tagger=tagger)
+    m.runner.start()
+    yield TestClient(m.app), tagger
+    m.runner.stop()
+
+
+def test_transcription_carries_the_sound_description(tagged_client):
+    c, tagger = tagged_client
+    r = c.post("/transcribe", json={"audio_b64": base64.b64encode(b"x" * 300).decode(), "name": "Harbor", "language": "English"})
+    d = _wait(c, r.json()["job_id"])
+    assert d["state"] == "done" and d["style_guess"] == "English, indie folk, female vocals, 92 BPM"
+    assert d["tags"]["genre"][0]["label"] == "indie folk" and d["timing"]["tag_windows"] == 3
+    assert tagger.calls == [(300, "English", 92)]          # the score's tempo feeds the style line
+    assert c.get("/healthz").json()["tagger"]["enabled"] is True
+    # describe=false skips it
+    r = c.post("/transcribe", json={"audio_b64": base64.b64encode(b"x" * 300).decode(), "describe": False})
+    d = _wait(c, r.json()["job_id"])
+    assert d["style_guess"] is None and len(tagger.calls) == 1
+
+
+def test_tagging_failure_is_only_a_warning(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "SCRATCH_DIR", str(tmp_path))
+    monkeypatch.setattr(m, "probe_seconds", lambda path: 1.0)
+    m.runner = m.Runner(factory=lambda: FakeModel(), tagger=FakeTagger(fail=True))
+    m.runner.start()
+    try:
+        c = TestClient(m.app)
+        d = _wait(c, c.post("/transcribe", json={"audio_b64": base64.b64encode(b"x" * 300).decode()}).json()["job_id"])
+        assert d["state"] == "done" and d["abc"] == ABC and d["style_guess"] is None
+        assert any("sound tagging failed" in w for w in d["warnings"])
+    finally:
+        m.runner.stop()
