@@ -44,6 +44,18 @@ def test_build_request_defaults_and_validation():
             m.build_request("pop", "hi", **bad)
 
 
+def test_build_request_cover_abc(monkeypatch):
+    """Cover mode (2026-09-13): an external score rides as `abc`; YuE2 then
+    tokenizes it instead of planning one, so cot=off is refused."""
+    abc = "X:1\r\nM:4/4\r\nL:1/8\r\nK:G\r\n|: G2 A2 B2 d2 | e4 d4 :|\r\n"
+    req = m.build_request("pop", "hi", cot="melody", seed=1, abc=abc)
+    assert req["abc"] == "X:1\nM:4/4\nL:1/8\nK:G\n|: G2 A2 B2 d2 | e4 d4 :|\n"
+    assert "abc" not in m.build_request("pop", "hi", cot="melody", seed=1, abc="   ")
+    for bad_abc, cot in ((abc, "off"), ("X:1\nM:4/4\n|: G2 |", "melody"), ("K:G\n", "full"), ("K:G\n" + "|G|" * 40000, "full")):
+        with pytest.raises(m.BadRequest):
+            m.build_request("pop", "hi", cot=cot, seed=1, abc=bad_abc)
+
+
 CITY_ABC = """X:1
 T:
 M:4/4
@@ -376,3 +388,107 @@ def test_unload_refused_while_busy(client):
     assert client.post("/unload").json()["unloaded"] is False
     _wait(client, job_id)
     assert client.post("/unload").json() == {"unloaded": True, "loaded": False}
+
+
+# --------------------------------------------------------------------------- #
+# long songs (2026-09-13): chunking + stitching
+# --------------------------------------------------------------------------- #
+
+LONG_LYRICS = "[Verse]\na1\na2\na3\n\n[Chorus]\nc1\nc2\n\n[Verse 2]\nb1\nb2\nb3\n\n[Chorus]\nc1\nc2\n\n[Bridge]\nd1\nd2\n\n[Outro]\ne1"
+
+
+def test_split_sections_and_plan_chunks():
+    secs = m.split_sections(m.normalize_lyrics(LONG_LYRICS))
+    assert [s.splitlines()[0] for s in secs] == ["[Verse]", "[Chorus]", "[Verse 2]", "[Chorus]", "[Bridge]", "[Outro]"]
+    assert [m.section_lines(s) for s in secs] == [3, 2, 3, 2, 2, 1]
+    # 6 lines per chunk: V(3)+C(2)=5 | V2(3)+C(2)=5 | B(2)+O(1)=3
+    chunks = m.plan_chunks(secs, 6)
+    assert [c.count("\n[") + 1 for c in chunks] == [2, 2, 2] and chunks[0].startswith("[Verse]") and chunks[2].startswith("[Bridge]")
+    # overlap: the seam repeats the previous chunk's chorus when it fits
+    chunks = m.plan_chunks(secs, 7, overlap_chorus=True)
+    assert chunks[1].startswith("[Chorus]\nc1\nc2\n\n[Verse 2]")
+    # one oversized section still becomes its own chunk
+    assert len(m.plan_chunks(["[Verse]\n" + "\n".join(["x"] * 40)], 6)) == 1
+    # untagged trailing block belongs to the previous section
+    assert m.split_sections("[Verse]\na\n\nb\nc") == ["[Verse]\na\nb\nc"]
+
+
+def test_abc_key_bpm_and_style_with_key():
+    assert m.abc_key_bpm("X:1\nQ:1/4=92\nK:Dm\n|D|") == ("D minor", 92)
+    assert m.abc_key_bpm("K:F#\n") == ("F# major", None)
+    assert m.style_with_key("English, indie folk", "K:F\nQ:1/4=92\n") == "English, indie folk, in the key of F major, 92 BPM"
+    assert m.style_with_key("English, pop, 120 BPM", "K:C\nQ:1/4=92\n") == "English, pop, 120 BPM, in the key of C major"
+    assert m.style_with_key("pop, in the key of F major", "K:F\n") == "pop, in the key of F major"
+    assert m.style_with_key("pop", None) == "pop"
+
+
+def test_equal_power_crossfade_and_trims():
+    a = np.ones((100, 2), dtype=np.float32)
+    b = np.ones((100, 2), dtype=np.float32) * 3
+    out = m.equal_power_crossfade(a, b, 20)
+    assert out.shape == (180, 2)
+    assert out[79, 0] == 1.0 and out[100, 0] == 3.0                    # untouched outside the seam
+    t = 10 / 19                                                        # sample 10 of a 20-point ramp
+    mid = out[80 + 10, 0]
+    assert abs(mid - (np.cos(t * np.pi / 2) * 1 + np.sin(t * np.pi / 2) * 3)) < 1e-4
+    gains = np.cos(np.linspace(0, 1, 20) * np.pi / 2) ** 2 + np.sin(np.linspace(0, 1, 20) * np.pi / 2) ** 2
+    assert np.allclose(gains, 1.0)                                     # equal power across the seam
+    assert m.equal_power_crossfade(a, b, 0).shape == (200, 2)
+    assert m.equal_power_crossfade(a, b, 500).shape == (100, 2)        # overlap capped at the shorter chunk
+    x = np.arange(48000 * 3, dtype=np.float32).reshape(-1, 1)
+    assert len(m.trim_edges(x, 48000, 0.5, 1.0)) == 48000 * 3 - 72000
+    assert len(m.trim_edges(x[:48000], 48000, 0.5, 0.5)) == 48000      # never below one second
+    chunks = [np.ones((48000 * 2, 2), np.float32)] * 3
+    stitched = m.stitch_chunks(chunks, 48000, 500, 0.25, 0.25)
+    # inner trims: 0.25 s off chunk0's end, both ends of chunk1, chunk2's start = 1.0 s; two 0.5 s crossfades
+    assert len(stitched) == 48000 * (6 - 1.0 - 1.0)
+
+
+def test_normalize_long_and_build_request():
+    assert m.normalize_long(None) is None and m.normalize_long(False) is None and m.normalize_long({"enabled": False}) is None
+    assert m.normalize_long(True) == {"max_lines_per_chunk": m.LONG_MAX_LINES, "overlap_chorus": False,
+                                      "crossfade_ms": 4000.0, "trim_start_s": 1.5, "trim_end_s": 2.5}
+    assert m.normalize_long({"max_lines_per_chunk": 10, "overlap_chorus": True, "crossfade_ms": 2000})["max_lines_per_chunk"] == 10
+    for bad in ({"max_lines_per_chunk": 2}, {"crossfade_ms": 99999}, {"trim_end_s": 99}, "yes"):
+        with pytest.raises(m.BadRequest):
+            m.normalize_long(bad)
+    req = m.build_request("pop", "hi", seed=1, long=True)
+    assert req["long"]["crossfade_ms"] == 4000.0
+    with pytest.raises(m.BadRequest):   # cover + long is v2
+        m.build_request("pop", "hi", cot="melody", seed=1, abc="K:C\n|C|", long=True)
+
+
+def test_long_lifecycle_renders_chunks_and_stitches(client, tmp_path):
+    r = client.post("/generate", json={"style": "English, indie folk", "lyrics": LONG_LYRICS, "seed": 5,
+                                       "long": {"max_lines_per_chunk": 6, "crossfade_ms": 500, "trim_start_s": 0.25, "trim_end_s": 0.25}})
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+    done = _wait(client, job_id, timeout=20.0)
+    assert done["state"] == "done" and done["long"] is True and done["cover"] is False
+    assert [c["index"] for c in done["chunks"]] == [1, 2, 3] and [c["seed"] for c in done["chunks"]] == [5, 6, 7]
+    assert [c["lines"] for c in done["chunks"]] == [5, 5, 3]
+    # FakePipe returns 2.0 s per chunk; three chunks, inner trims 1.0 s total, two 0.5 s crossfades → 4.0 s
+    assert done["audio_seconds"] == 4.0
+    # chunk 2+ carry the first plan's key (FakePipe's ABC is K:C, no Q:)
+    assert done["chunks"][0]["style"] == "English, indie folk"
+    assert done["chunks"][1]["style"] == "English, indie folk, in the key of C major"
+    score = client.get(f"/jobs/{job_id}/score").text
+    assert score.startswith("% chunk 1\nX:1") and "% chunk 3" in score
+    assert done["progress"] == 1.0 and done["timing"]["semantic_tokens"] == 60   # 3 × 20 fake tokens
+    r = client.get(f"/jobs/{job_id}/audio")
+    assert r.status_code == 200 and r.content[:4] == b"fLaC"
+
+
+def test_long_progress_stays_within_chunk_spans(client):
+    r = client.post("/generate", json={"style": "pop", "lyrics": LONG_LYRICS, "seed": 1, "long": {"max_lines_per_chunk": 6}})
+    job_id = r.json()["job_id"]
+    seen = []
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        js = client.get(f"/jobs/{job_id}").json()
+        seen.append(js["progress"])
+        if js["state"] in ("done", "failed"):
+            break
+        time.sleep(0.01)
+    assert seen == sorted(seen), "progress must never go backwards across chunks"
+    assert seen[-1] == 1.0
