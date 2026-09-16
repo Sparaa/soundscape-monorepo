@@ -9,7 +9,9 @@ deletes — nothing touches the host disk.
 
 Routes
   GET    /healthz             → {ok, loaded, busy, queue, gpu, model, vae, runtime}
-  POST   /generate            → {style, lyrics, cot?, seed?, cfg_scale?, id?} ⇒ {job_id, state, position}
+  POST   /generate            → {style, lyrics, cot?, seed?, cfg_scale?, id?, priority?} ⇒ {job_id, state, position}
+                                priority interactive (default) | background — interactive jobs jump ahead of queued
+                                background ones (Soundscape's radio renders in the background; vidmakr's user clicks don't wait)
   GET    /jobs                → in-memory job list (state only)
   GET    /jobs/{id}           → {state, stage, progress, tokens, seconds, audio_seconds, truncated, error, ...}
   GET    /jobs/{id}/audio     → audio bytes (?format=flac|mp3|m4a; flac is the master)
@@ -64,6 +66,7 @@ VERIFY_HASHES = os.environ.get("MUSIC_VERIFY_HASHES", "first")  # first | always
 IDLE_UNLOAD_MIN = float(os.environ.get("MUSIC_IDLE_UNLOAD_MIN", "10"))
 JOB_RETAIN_MIN = float(os.environ.get("MUSIC_JOB_RETAIN_MIN", "30"))
 MAX_QUEUE = int(os.environ.get("MUSIC_MAX_QUEUE", "8"))
+PRIORITIES = {"interactive": 0, "background": 1}   # lower runs first; background = a radio filling its buffer
 MAX_STYLE_CHARS = int(os.environ.get("MUSIC_MAX_STYLE_CHARS", "600"))
 MAX_LYRICS_CHARS = int(os.environ.get("MUSIC_MAX_LYRICS_CHARS", "6000"))
 SWEEP_SEC = float(os.environ.get("MUSIC_SWEEP_SEC", "30"))
@@ -881,7 +884,8 @@ class Runner:
         self.pipe: Any = None
         self.lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
-        self.q: "queue.Queue[str]" = queue.Queue()
+        self.q: "queue.PriorityQueue[tuple[int, int, str]]" = queue.PriorityQueue()   # (priority, seq, job_id)
+        self._seq = 0
         self.current: Optional[str] = None
         self.last_activity = time.time()
         self.verified = False
@@ -938,17 +942,21 @@ class Runner:
 
     # ---- jobs --------------------------------------------------------------
     def submit(self, request: dict[str, Any]) -> tuple[Job, int]:
+        prio = PRIORITIES.get(str(request.get("priority") or "interactive"), 0)
         with self.lock:
-            pending = sum(1 for j in self.jobs.values() if j.state == "queued")
-            if pending >= MAX_QUEUE:
+            queued = [j for j in self.jobs.values() if j.state == "queued"]
+            if len(queued) >= MAX_QUEUE:
                 raise BadRequest(f"queue is full ({MAX_QUEUE} pending)")
             job_id = uuid.uuid4().hex[:12]
             job = Job(id=job_id, request=request, dir=Path(SCRATCH_DIR) / job_id)
-            # jobs ahead of this one: the running song plus everything queued
-            position = pending + (1 if self.current is not None else 0)
+            # jobs ahead of this one: the running song plus queued jobs of the same or higher priority
+            ahead = sum(1 for j in queued if PRIORITIES.get(str(j.request.get("priority") or "interactive"), 0) <= prio)
+            position = ahead + (1 if self.current is not None else 0)
             self.jobs[job_id] = job
             self.last_activity = time.time()
-        self.q.put(job_id)
+            self._seq += 1
+            seq = self._seq
+        self.q.put((prio, seq, job_id))
         return job, position
 
     def get(self, job_id: str) -> Job:
@@ -986,7 +994,7 @@ class Runner:
     def _work(self) -> None:
         while not self._stop.is_set():
             try:
-                job_id = self.q.get(timeout=1.0)
+                _prio, _seq, job_id = self.q.get(timeout=1.0)
             except queue.Empty:
                 continue
             job = self.jobs.get(job_id)
@@ -1024,7 +1032,7 @@ class Runner:
     def _run(self, job: Job) -> None:
         from yue2.protocol import SongRequest
         pipe = self.ensure_loaded(job)
-        base = {k: v for k, v in job.request.items() if k not in ("long", "hook")}
+        base = {k: v for k, v in job.request.items() if k not in ("long", "hook", "priority")}
         long = job.request.get("long")
         lyric_chunks = (plan_chunks(split_sections(base["lyrics"]), long["max_lines_per_chunk"], long["overlap_chorus"])
                         if long else [base["lyrics"]])
@@ -1201,6 +1209,8 @@ class GenerateRequest(BaseModel):
     # spliced into a freshly planned song — new verses, the original hook.
     hook_abc: Optional[str] = None
     hook_sections: Optional[list[str]] = None
+    # Queue priority: interactive (default) jumps ahead of queued background jobs (a radio filling its buffer).
+    priority: Optional[str] = Field(None, pattern=r"^(interactive|background)$")
 
 
 def _gpu_info() -> dict[str, Any]:
@@ -1235,6 +1245,8 @@ async def generate(req: GenerateRequest) -> dict[str, Any]:
     try:
         request = build_request(req.style, req.lyrics, req.cot, req.seed, req.cfg_scale, req.id,
                                 abc=req.abc, long=req.long, hook_abc=req.hook_abc, hook_sections=req.hook_sections)
+        if req.priority:
+            request["priority"] = req.priority
         job, position = runner.submit(request)
     except BadRequest as exc:
         raise HTTPException(400, str(exc))

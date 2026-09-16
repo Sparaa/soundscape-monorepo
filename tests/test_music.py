@@ -672,3 +672,15 @@ def test_hook_lifecycle_splices_then_replans(tmp_path, monkeypatch):
         score = c.get(f"/jobs/{done['job_id']}/score").text
         assert "g12a2g2-" in score and "PLAN-CHORUS" not in score and "% verse" in score
     runner.stop()
+
+
+def test_interactive_jobs_jump_ahead_of_background(monkeypatch):
+    """A radio fills its buffer in the background; a user's click must not wait behind it."""
+    runner = m.Runner(factory=lambda: None)          # worker never started: inspect the queue order directly
+    bg1, p1 = runner.submit({"style": "s", "lyrics": "l", "cot": "full", "seed": 1, "id": "bg1", "priority": "background"})
+    bg2, p2 = runner.submit({"style": "s", "lyrics": "l", "cot": "full", "seed": 2, "id": "bg2", "priority": "background"})
+    ui, p3 = runner.submit({"style": "s", "lyrics": "l", "cot": "full", "seed": 3, "id": "ui"})
+    assert (p1, p2) == (0, 1) and p3 == 0                       # the interactive job reports nothing ahead of it
+    order = [runner.q.get_nowait()[2] for _ in range(3)]
+    assert order == [ui.id, bg1.id, bg2.id]
+    assert m.build_request("s", "l", None, 1, None, None) .get("priority") is None
