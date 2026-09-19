@@ -1,5 +1,10 @@
-# Soundscape — self-hosted dynamic radio. Sidecars come from their own repos/images (shared with vidmakr):
-#   docker build -t yue2-sidecar ../yue2-sidecar && docker build -t sheetsage-sidecar ../sheetsage-sidecar && docker build -t clipgrab-sidecar ../clipgrab-sidecar
+# Soundscape monorepo — self-hosted dynamic radio. Everything builds from this repo, on Linux or on
+# Windows (Docker Desktop + WSL2):
+#     docker compose --profile gpu --profile llm up -d --build
+# Profiles:
+#   gpu  the YuE2 (composer) and SheetSage2 (transcriber + CLAP) sidecars — need an NVIDIA GPU
+#   llm  a bundled Ollama that writes titles / lyrics (the api talks to it at http://ollama:11434/v1)
+# Without a profile, point YUE2_URL / SHEETSAGE_URL / LLM_BASE_URL in .env at services you already run.
 services:
   web:
     build: ./web
@@ -17,8 +22,8 @@ services:
       YUE2_URL: ${YUE2_URL:-http://yue2:3015}
       SHEETSAGE_URL: ${SHEETSAGE_URL:-http://sheetsage:3016}
       CLIPGRAB_URL: ${CLIPGRAB_URL:-http://clipgrab:3014}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:30000/v1}
-      LLM_MODEL: ${LLM_MODEL:-qwen3.8-27b}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
       LLM_API_KEY: ${LLM_API_KEY:-local}
       LIBRARY_DIR: /library
     volumes: ["${LIBRARY_DIR:-./library}:/library"]
@@ -26,16 +31,18 @@ services:
     extra_hosts: ["host.docker.internal:host-gateway"]
     logging: {driver: json-file, options: {max-size: 5m, max-file: "2"}}   # enough history to diagnose a radio stall
   yue2:
-    profiles: ["gpu"]            # `docker compose --profile gpu up -d` runs the GPU sidecars here; without it, point *_URL at existing ones
+    profiles: ["gpu"]
+    build: ./sidecars/yue2-sidecar
     image: yue2-sidecar:latest
     container_name: soundscape-yue2
     restart: unless-stopped
-    environment: {SCRATCH_DIR: /scratch, HF_HOME: /data/hf-cache, MUSIC_MODEL: m-a-p/YuE2-3B, MUSIC_VAE: m-a-p/YuE2-Vae, MUSIC_LOCAL_FILES_ONLY: "0", MUSIC_BUDGET_GIB: "20", MUSIC_IDLE_UNLOAD_MIN: "10", NVIDIA_VISIBLE_DEVICES: "${SOUNDSCAPE_GPU_UUID:-all}", NVIDIA_DRIVER_CAPABILITIES: compute,utility}
+    environment: {SCRATCH_DIR: /scratch, HF_HOME: /data/hf-cache, MUSIC_MODEL: m-a-p/YuE2-3B, MUSIC_VAE: m-a-p/YuE2-Vae, MUSIC_LOCAL_FILES_ONLY: "0", MUSIC_BUDGET_GIB: "${MUSIC_BUDGET_GIB:-20}", MUSIC_IDLE_UNLOAD_MIN: "10", NVIDIA_VISIBLE_DEVICES: "${SOUNDSCAPE_GPU_UUID:-all}", NVIDIA_DRIVER_CAPABILITIES: compute,utility}
     volumes: ["yue2-hf-cache:/data/hf-cache"]
     tmpfs: ["/scratch:size=2g"]
     deploy: {resources: {reservations: {devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]}}}
   sheetsage:
-    profiles: ["gpu"]            # `docker compose --profile gpu up -d` runs the GPU sidecars here; without it, point *_URL at existing ones
+    profiles: ["gpu"]
+    build: ./sidecars/sheetsage-sidecar
     image: sheetsage-sidecar:latest
     container_name: soundscape-sheetsage
     restart: unless-stopped
@@ -44,10 +51,22 @@ services:
     tmpfs: ["/scratch:size=1g"]
     deploy: {resources: {reservations: {devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]}}}
   clipgrab:
+    build: ./sidecars/clipgrab-sidecar
     image: clipgrab-sidecar:latest
     container_name: soundscape-clipgrab
     restart: unless-stopped
     tmpfs: ["/scratch:size=2g"]
+  ollama:
+    profiles: ["llm"]
+    image: ollama/ollama:latest
+    container_name: soundscape-ollama
+    restart: unless-stopped
+    # KEEP_ALIVE=0 unloads the writer right after each call so YuE2 gets the whole GPU (matters on 16 GB cards).
+    # Pull the model once: docker compose exec ollama ollama pull qwen2.5:7b-instruct
+    environment: {OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-0}", OLLAMA_CONTEXT_LENGTH: "8192", NVIDIA_VISIBLE_DEVICES: "${SOUNDSCAPE_GPU_UUID:-all}", NVIDIA_DRIVER_CAPABILITIES: compute,utility}
+    volumes: ["ollama-models:/root/.ollama"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]}}}
 volumes:
   yue2-hf-cache: {}
   sheetsage-hf-cache: {}
+  ollama-models: {}

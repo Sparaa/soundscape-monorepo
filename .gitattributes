@@ -1,0 +1,10 @@
+# Docker builds Linux images from these files: shell scripts and Dockerfiles must keep LF line endings even when
+# the repo is cloned on Windows with core.autocrlf=true (a CRLF shebang gives "exec ./entrypoint.sh: no such file").
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+*.flac binary
+*.mp3 binary
+*.wav binary
