@@ -1,5 +1,9 @@
 # Soundscape (monorepo)
 
+<p align="center">
+  <img src="docs/hero.png" alt="Soundscape — the Spanish Guitar station playing a cover, with the red-CRT pulse visualizer, lyrics, up-next queue and seed list" width="100%">
+</p>
+
 **A radio that never runs out of songs.** Seed a station with your own music — a file, or a link `yt-dlp` can fetch —
 and a music agent learns the seeds' sound and keeps composing: new songs in that style, reinterpretations, hooks with
 new verses, the occasional straight cover with new words. Two songs stay cued while you listen. A beat-locked
