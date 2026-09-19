@@ -13,8 +13,10 @@ COVER_MODES = ("faithful", "reinterpret", "hook")
 COVER_COOLDOWN_S = 3600.0     # a faithful cover of the same seed at most once per hour of airtime
 BPM_JITTER = 0.06
 MIN_SECONDS, MAX_SECONDS = 120.0, 330.0
-FALLBACK_THEMES = ["a night drive with the windows down", "a letter never sent", "the last train home", "rain on a tin roof",
-                   "the friend who moved away", "counting streetlights", "a promise kept too late", "sunrise after the party"]
+FALLBACK_THEMES = ["she keeps his voicemail but never calls back", "driving home after the diagnosis, radio off",
+                   "closing the shop alone the night the team lost", "he finds her list of names for the dog",
+                   "the friend who moved away texts at 2 a.m.", "moving out of the flat, one box is his",
+                   "a promise kept a year too late", "walking home after the party, shoes in hand"]   # situations, not titles
 
 
 @dataclass

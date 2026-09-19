@@ -19,7 +19,7 @@ import threading
 
 from fastapi.responses import Response
 
-from . import abc as abclib, analyze, composer, config, db, ingest, library, llm as llmmod, profile, radio, sidecars
+from . import prompts, abc as abclib, analyze, composer, config, db, ingest, library, llm as llmmod, profile, radio, sidecars
 
 log = logging.getLogger("soundscape")
 app = FastAPI(title="Soundscape", version="0.2.0")
@@ -262,14 +262,19 @@ async def _ensure_themes(sid: str) -> None:
     """First Play on a station: ask the LLM for its lyrical themes once (kept in settings)."""
     st = _row(con().execute("SELECT * FROM stations WHERE id=?", (sid,)).fetchone())
     settings = st.get("settings") or {}
-    if settings.get("themes") or not st.get("profile"):
+    if not st.get("profile"):
+        return
+    if settings.get("themes") and settings.get("themes_v") == prompts.THEMES_VERSION:
         return
     try:
         themes = await llmmod.station_themes(llmmod.LLM(), style=st["profile"]["style"], blurb=settings.get("blurb", ""))
     except Exception as e:
         log.warning("themes: %s", e)
         return
+    if settings.get("themes"):
+        log.info("themes: refreshed for %s (prompt v%s)", sid, prompts.THEMES_VERSION)
     settings["themes"] = themes
+    settings["themes_v"] = prompts.THEMES_VERSION
     con().execute("UPDATE stations SET settings=? WHERE id=?", (json.dumps(settings), sid))
     con().commit()
 
@@ -322,6 +327,8 @@ def patch_settings(sid: str, req: StationSettings) -> dict:
     settings = st.get("settings") or {}
     for k, v in req.model_dump(exclude_none=True).items():
         settings[k] = v
+    if req.themes is not None:
+        settings["themes_v"] = prompts.THEMES_VERSION   # hand-written themes are never replaced by a prompt bump
     con().execute("UPDATE stations SET settings=? WHERE id=?", (json.dumps(settings), sid))
     con().commit()
     return _station(sid)
