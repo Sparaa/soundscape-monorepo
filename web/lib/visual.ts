@@ -67,15 +67,17 @@ export class BeatClock {
   }
 }
 
-/** Percussive transient envelope ("punch"): positive spectral flux across the log spectrum from ~60 Hz to ~6 kHz
- * (kick body, snare, claps, hat attacks), measured against the track's own running flux floor so quiet and loud mixes
- * pulse alike; fast attack, ~100 ms decay. Unlike `BeatClock.hit` it has no refractory period and is not bass-only, so
- * the center of the scope can move with the whole drum kit. Bins index the 64-bin logSpectrum (30 Hz–9 kHz). */
+/** Bass transient envelope ("punch"): positive spectral flux across the log spectrum from 30 Hz to ~150 Hz (sub-bass,
+ * kick fundamental and body, bass-guitar/808 attacks), measured against the track's own running flux floor so quiet
+ * and loud mixes pulse alike; fast attack, ~100 ms decay. Unlike `BeatClock.hit` it has no refractory period, so every
+ * kick and bass pluck moves the center of the scope — snares, claps, hats and vocals sit above the cutoff and do not.
+ * (Was 60 Hz–6 kHz until 2026-09-19: the whole kit plus vocals made the center jitter on every syllable.)
+ * Bins index the 64-bin logSpectrum (30 Hz–9 kHz): bin 18 ≈ 150 Hz, the same edge as `bands.bass`. */
 export class PunchDetector {
   private prev: number[] = [];
   private avg = 0.02;
   punch = 0;
-  constructor(public lo = 8, public hi = 60, public decay = 0.78, public gain = 2.5) {}
+  constructor(public lo = 0, public hi = 18, public decay = 0.78, public gain = 2.5) {}
   update(spec: number[]): number {
     let flux = 0, n = 0;
     for (let i = Math.max(0, this.lo); i < Math.min(spec.length, this.hi); i++) {
