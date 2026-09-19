@@ -67,28 +67,38 @@ export class BeatClock {
   }
 }
 
-/** Bass transient envelope ("punch"): positive spectral flux across the log spectrum from 30 Hz to ~150 Hz (sub-bass,
- * kick fundamental and body, bass-guitar/808 attacks), measured against the track's own running flux floor so quiet
- * and loud mixes pulse alike; fast attack, ~100 ms decay. Unlike `BeatClock.hit` it has no refractory period, so every
- * kick and bass pluck moves the center of the scope — snares, claps, hats and vocals sit above the cutoff and do not.
- * (Was 60 Hz–6 kHz until 2026-09-19: the whole kit plus vocals made the center jitter on every syllable.)
- * Bins index the 64-bin logSpectrum (30 Hz–9 kHz): bin 18 ≈ 150 Hz, the same edge as `bands.bass`. */
+/** Bass transient envelope ("punch"): positive spectral flux across the log spectrum from ~50 Hz to ~150 Hz (kick
+ * fundamental and body, bass-guitar/808 attacks), measured against the track's own running flux floor; fast attack,
+ * ~100 ms decay. Unlike `BeatClock.hit` it has no refractory period, so every kick and bass pluck moves the center of
+ * the scope — snares, claps, hats and vocals sit above the cutoff and do not, and sub-bass under ~50 Hz (which most
+ * speakers barely reproduce) sits below it. An audibility gate on the band's absolute analyser level (levelLo..levelHi,
+ * 0..1 over the AnalyserNode's -100..-30 dB) stops faint transients in quiet passages from pulsing: the adaptive floor
+ * alone normalised them up to a full pulse ("lights up for sound I can't hear"). 0.50/0.75 calibrated 2026-09-19 over
+ * five library songs (soundscape-native-linux tools/punch_calibrate.cpp): pulses ~2.7/s → ~1/s, all at ≥ ~-50 dBFS.
+ * (Was 60 Hz–6 kHz, no gate, until 2026-09-19.) Bins index the 64-bin logSpectrum (30 Hz–9 kHz): bin 6 ≈ 50 Hz,
+ * bin 18 ≈ 150 Hz = the `bands.bass` edge. */
 export class PunchDetector {
   private prev: number[] = [];
   private avg = 0.02;
   punch = 0;
-  constructor(public lo = 0, public hi = 18, public decay = 0.78, public gain = 2.5) {}
+  level = 0;   // the band's mean analyser level this frame, 0..1
+  constructor(public lo = 6, public hi = 18, public decay = 0.78, public gain = 2.5, public levelLo = 0.50, public levelHi = 0.75) {}
   update(spec: number[]): number {
-    let flux = 0, n = 0;
+    let flux = 0, sum = 0, n = 0;
     for (let i = Math.max(0, this.lo); i < Math.min(spec.length, this.hi); i++) {
       const d = spec[i] - (this.prev[i] ?? spec[i]);
       if (d > 0) flux += d;
+      sum += spec[i];
       n++;
     }
     this.prev = spec.slice();
     flux = n ? flux / n : 0;
+    this.level = n ? sum / n : 0;
     this.avg += (flux - this.avg) * 0.05;
-    const raw = Math.min(1, Math.max(0, (flux - this.avg) / Math.max(0.004, this.avg * this.gain)));
+    let raw = Math.min(1, Math.max(0, (flux - this.avg) / Math.max(0.004, this.avg * this.gain)));
+    // audibility gate (smoothstep on the band's absolute level): faint sub-bass or a near-silent passage cannot pulse
+    const g = Math.min(1, Math.max(0, (this.level - this.levelLo) / Math.max(1e-3, this.levelHi - this.levelLo)));
+    raw *= g * g * (3 - 2 * g);
     this.punch = Math.max(raw, this.punch * this.decay);
     return this.punch;
   }
