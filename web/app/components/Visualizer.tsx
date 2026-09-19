@@ -5,7 +5,7 @@ import * as THREE from "three";
 import type { Song } from "@/lib/api";
 import { sectionCues, type SectionCue } from "@/lib/abc";
 import { SCENES, type Scene } from "@/lib/scenes";
-import { BeatClock, bandEnergies, frame, logSpectrum, meter, paletteFor, type Palette, type VisualFrame } from "@/lib/visual";
+import { BeatClock, adaptQuality, bandEnergies, frame, logSpectrum, meter, paletteFor, type Palette, type VisualFrame } from "@/lib/visual";
 import type { RadioPlayer } from "@/lib/player";
 
 export const FEED_CHANNEL = "soundscape-visual-feed";
@@ -29,6 +29,9 @@ export default function Visualizer({ player, song, tags, sceneName, onScene, lab
     const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: "high-performance" });
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
     renderer.setClearColor(0x000000, 1);
+    // The canvas fills its host by CSS; setSize(..., false) below never touches its style, so a lower pixel ratio only
+    // lowers the backing resolution instead of shrinking the canvas itself into the top-left corner.
+    renderer.domElement.style.cssText = "display:block;width:100%;height:100%";
     el.appendChild(renderer.domElement);
     const scene3 = new THREE.Scene();
     const cam = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
@@ -67,9 +70,11 @@ export default function Visualizer({ player, song, tags, sceneName, onScene, lab
       if (now - hudT > 100) { hudT = now; setHud(f); }               // HUD text at 10 Hz
       frames++;
       if (now - fpsT > 1000) {                         // adaptive quality: drop pixel ratio when below 45 fps
-        const cur = frames * 1000 / (now - fpsT); setFps(Math.round(cur)); setRms(bands.rms); frames = 0; fpsT = now;
-        if (cur < 45 && quality > 0.5) { quality -= 0.25; renderer.setPixelRatio(Math.min(2, window.devicePixelRatio) * quality); }
-        else if (cur > 58 && quality < 1) { quality += 0.25; renderer.setPixelRatio(Math.min(2, window.devicePixelRatio) * quality); }
+        const cur = frames * 1000 / (now - fpsT); setFps(Math.round(cur)); setRms(bands.rms);
+        const attentive = document.visibilityState === "visible" && document.hasFocus();   // throttled frames are not a slow GPU
+        const q = adaptQuality(quality, cur, now - fpsT, attentive);
+        if (q !== quality) { quality = q; renderer.setPixelRatio(Math.min(2, window.devicePixelRatio) * quality); }
+        frames = 0; fpsT = now;
       }
     };
     tick();

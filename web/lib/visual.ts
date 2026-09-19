@@ -111,3 +111,14 @@ export function meter(v: number, n = 12): string {
   const k = Math.max(0, Math.min(n, Math.round((isFinite(v) ? v : 0) * n)));
   return "▰".repeat(k) + "▱".repeat(n - k);
 }
+
+/** Adaptive render quality (a multiplier on the device pixel ratio, 0.5..1 in 0.25 steps) from one second's frame rate.
+ * A sample taken while the window was unfocused, hidden or occluded says nothing about the GPU — browsers throttle
+ * animation frames there — so it is ignored; so is a sample that spans a gap (the tab was frozen). Without this the
+ * visualizer stepped down to half resolution whenever the window lost focus and climbed back over two seconds. */
+export function adaptQuality(quality: number, fps: number, sampleMs: number, attentive: boolean): number {
+  if (!attentive || sampleMs > 1500) return quality;
+  if (fps < 45 && quality > 0.5) return quality - 0.25;
+  if (fps > 58 && quality < 1) return quality + 0.25;
+  return quality;
+}

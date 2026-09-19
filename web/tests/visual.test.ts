@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { sectionAt, sectionCues } from "@/lib/abc";
-import { BeatClock, bandEnergies, frame, logSpectrum, meter, paletteFor } from "@/lib/visual";
+import { BeatClock, adaptQuality, bandEnergies, frame, logSpectrum, meter, paletteFor } from "@/lib/visual";
 
 const SCORE = ["X:1", "M:4/4", "L:1/16", "Q:1/4=120", "V: Vocal", "V: Ins", "K:C",
   "% intro", "V: Vocal", "Z|Z|", "V: Ins", "C4E4G4c4|C4E4G4c4|",
@@ -78,5 +78,21 @@ describe("meter", () => {
     expect(meter(2, 4)).toBe("▰▰▰▰");
     expect(meter(-1, 4)).toBe("▱▱▱▱");
     expect(meter(NaN, 3)).toBe("▱▱▱");
+  });
+});
+
+describe("adaptQuality", () => {
+  it("steps down on a genuinely slow second and back up on a fast one", () => {
+    expect(adaptQuality(1, 30, 1000, true)).toBe(0.75);
+    expect(adaptQuality(0.75, 30, 1000, true)).toBe(0.5);
+    expect(adaptQuality(0.5, 30, 1000, true)).toBe(0.5);          // floor
+    expect(adaptQuality(0.5, 60, 1000, true)).toBe(0.75);
+    expect(adaptQuality(1, 60, 1000, true)).toBe(1);              // ceiling
+    expect(adaptQuality(1, 50, 1000, true)).toBe(1);              // steady zone
+  });
+  it("ignores throttled samples: unfocused / hidden window, or a sample spanning a gap", () => {
+    expect(adaptQuality(1, 5, 1000, false)).toBe(1);              // focus went to another window
+    expect(adaptQuality(1, 2, 12000, true)).toBe(1);              // tab was frozen for 12 s
+    expect(adaptQuality(0.5, 60, 1000, false)).toBe(0.5);         // nor climb while unfocused: nothing to see
   });
 });
