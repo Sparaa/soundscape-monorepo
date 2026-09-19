@@ -97,17 +97,23 @@ describe("adaptQuality", () => {
   });
 });
 
-describe("punch (percussive transients)", () => {
+describe("punch (bass transients)", () => {
   const quiet = new Array(64).fill(0.1);
-  it("fires on a broadband transient above the bass band, then decays", () => {
+  it("fires on a kick (30–150 Hz burst), then decays", () => {
     const d = new PunchDetector();
     for (let i = 0; i < 30; i++) d.update(quiet);                      // settle the running floor
-    const snare = quiet.map((v, i) => (i >= 20 && i < 50 ? v + 0.35 : v));   // ~250 Hz–3 kHz burst: a snare, not a kick
-    const hit = d.update(snare);
+    const kick = quiet.map((v, i) => (i < 16 ? v + 0.35 : v));          // 30–125 Hz burst: a kick / 808
+    const hit = d.update(kick);
     expect(hit).toBeGreaterThan(0.8);
-    const after = [d.update(snare), d.update(snare), d.update(snare)];     // sustained level = no new flux → decays
+    const after = [d.update(kick), d.update(kick), d.update(kick)];     // sustained level = no new flux → decays
     expect(after[2]).toBeLessThan(hit * 0.6);
     expect(after[2]).toBeGreaterThan(0);
+  });
+  it("ignores a snare / vocal burst above the cutoff", () => {
+    const d = new PunchDetector();
+    for (let i = 0; i < 30; i++) d.update(quiet);
+    const snare = quiet.map((v, i) => (i >= 20 && i < 50 ? v + 0.35 : v));   // ~180 Hz–3 kHz: snare body, vocals, hats
+    expect(d.update(snare)).toBeLessThan(0.05);
   });
   it("adapts to the track: a steady rumble is not punch", () => {
     const d = new PunchDetector();
