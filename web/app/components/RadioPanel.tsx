@@ -16,7 +16,9 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
   const [song, setSong] = useState<Song | null>(null);
   const [pos, setPos] = useState({ t: 0, d: 0 });
   const [err, setErr] = useState<string | null>(null);
-  const [paused, setPausedState] = useState(false);
+  // "paused" = nothing is meant to play in THIS browser tab. Starts true: after a reload the server may still say
+  // "playing" (the agent keeps composing) but no audio runs here until the listener presses Play.
+  const [paused, setPausedState] = useState(true);
   const setPaused = (v: boolean) => { pausedRef.current = v; setPausedState(v); };
   const [playerObj, setPlayerObj] = useState<RadioPlayer | null>(null);
   const [scene, setScene] = useState<string>(() => { try { return localStorage.getItem("soundscape.scene") ?? "radial"; } catch { return "radial"; } });
@@ -31,7 +33,7 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
   const playlistRef = useRef<Playlist | null>(null); playlistRef.current = playlist;
   const plIndex = useRef(-1);
 
-  const pausedRef = useRef(false);
+  const pausedRef = useRef(true);
   const refresh = useCallback(async () => {
     try {
       const st = await radioStatus(sid);
@@ -78,19 +80,21 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
       }
       const st = await radioPlay(sid);
       setStatus(st);
-      if (p.paused && (await p.resume())) { setPaused(false); return; }   // Stop paused it: pick the same song up again
+      setPaused(false);                                              // every Play path: the button must read Stop from here on
+      if (p.paused && (await p.resume())) return;                    // Stop paused it: pick the same song up again
       // start as soon as the first song is cued (the spare makes this instant after the first session)
       const first = (await radioNext(sid));
       setStatus(first.status);
       if (first.song) await p.start(first.song);
       else {
         const wait = window.setInterval(async () => {
+          if (pausedRef.current) { window.clearInterval(wait); return; }   // Stop pressed while composing
           const r = await radioNext(sid); setStatus(r.status);
           if (r.song) { window.clearInterval(wait); await p.start(r.song); }
           if (r.status.state === "stopped") window.clearInterval(wait);
         }, 3000);
       }
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(String(e)); setPaused(true); }
   };
   const onStop = async () => { player.current?.pause(); setPaused(true); setStatus(await radioStop(sid)); };
   /** Play a saved song now (crossfading out of whatever is on) and continue through the playlist from there. */
