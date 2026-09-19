@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { crossfadeGains, nextStartAt, RadioPlayer } from "@/lib/player";
+import { crossfadeGains, nextStartAt, RadioPlayer, STUCK_MS } from "@/lib/player";
 import { planLabel, type Song } from "@/lib/api";
 
 describe("player helpers", () => {
@@ -193,6 +193,45 @@ describe("RadioPlayer survives a second crossfade inside the first one's cleanup
     await vi.advanceTimersByTimeAsync(300);
     expect(asks).toHaveBeenCalledTimes(1);
     expect(p.current.song?.id).toBe("z");
+    p.stop();
+  });
+
+  it("a play() that never settles no longer hangs the pull: the crossfade proceeds after the timeout", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    const errors: unknown[] = [];
+    p.onNextError = (e) => errors.push(e);
+    const asks = vi.fn<() => Promise<Song | null>>().mockResolvedValueOnce(song("b", 100)).mockResolvedValue(song("c", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    audios[1].play = function () { this.paused = false; return new Promise<void>(() => undefined); };   // b's deck: pending forever
+    audios[0].duration = 100; audios[0].currentTime = 98;
+    await vi.advanceTimersByTimeAsync(300);
+    expect(p.current.song?.id).toBe("a");                      // still waiting on b
+    await vi.advanceTimersByTimeAsync(5200);
+    expect(p.current.song?.id).toBe("b");                      // switched anyway, pull released
+    expect(errors).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3500);                   // a's deck released
+    expect(audios[0].src).toBe("");
+    expect(p.standby.song).toBeNull();
+    await vi.advanceTimersByTimeAsync(STUCK_MS + 500);         // b never moves → watchdog skips ahead to c
+    expect(asks).toHaveBeenCalledTimes(2);
+    expect(p.current.song?.id).toBe("c");
+    p.stop();
+  });
+
+  it("a playhead that stops moving mid-song skips ahead; a moving one does not", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    const asks = vi.fn<() => Promise<Song | null>>().mockResolvedValue(song("b", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    const a = audios[0]; a.duration = 100;
+    for (let i = 0; i < 80; i++) { a.currentTime = i * 0.25; await vi.advanceTimersByTimeAsync(250); }   // 20 s of normal playback
+    expect(asks).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(STUCK_MS - 1000);        // frozen, but not yet long enough
+    expect(asks).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(asks).toHaveBeenCalledTimes(1);
+    expect(p.current.song?.id).toBe("b");
     p.stop();
   });
 });

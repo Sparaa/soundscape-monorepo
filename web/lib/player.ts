@@ -3,6 +3,11 @@
 import type { Song } from "./api";
 
 export const CROSSFADE_S = 3;
+/** How long a crossfade waits for the incoming deck's play() before switching anyway (a promise that never settles
+ * used to hang the pull forever: no more automatic advances, only Skip worked). */
+export const PLAY_TIMEOUT_MS = 5000;
+/** A playhead that has not moved for this long while we are meant to be playing counts as a dead song → next one. */
+export const STUCK_MS = 15000;
 
 /** Seconds into a track at which the next one should start (crossfade), never before 1 s. */
 export function nextStartAt(durationS: number | null | undefined, crossfadeS = CROSSFADE_S): number {
@@ -33,6 +38,8 @@ export class RadioPlayer {
   private fetching = false;
   private retryAt = 0;      // performance.now() before which we don't ask again (nothing cued yet, or the last ask failed)
   private playing = false;  // between start/resume/crossfadeTo and pause/stop: the radio is expected to keep going by itself
+  private lastT = -1;       // watchdog: last playhead seen and when it last moved
+  private lastMove = 0;
 
   constructor(audioUrl: (id: string) => string) {
     const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -90,8 +97,13 @@ export class RadioPlayer {
     try {
       const cur = this.current;
       const dur = isFinite(cur.el.duration) && cur.el.duration > 0 ? cur.el.duration : cur.song?.seconds ?? null;
-      const over = !cur.song || cur.el.ended;
-      const due = this.playing && (over || cur.el.currentTime >= nextStartAt(dur));
+      const now = performance.now();
+      const t = cur.el.currentTime;
+      if (t !== this.lastT || !this.playing || this.fetching) { this.lastT = t; this.lastMove = now; }
+      const stuck = this.playing && !!cur.song && !cur.el.paused && now - this.lastMove > STUCK_MS;   // play() never started, a dead stream
+      const over = !cur.song || cur.el.ended || stuck;
+      const due = this.playing && (over || t >= nextStartAt(dur));
+      if (stuck) this.onNextError(new Error(`"${cur.song?.title ?? cur.song?.id}" stopped moving — skipping ahead`));
       if (due && !this.fetching && !this.standby.song && performance.now() >= this.retryAt) void this.pull(over ? 0.2 : CROSSFADE_S);
     } catch (e) {
       this.onNextError(e);                // never let one bad read kill the chain
@@ -122,8 +134,12 @@ export class RadioPlayer {
     const outGen = out.gen, innGen = inn.gen;
     this.playing = true;
     this.ensureTicking();
-    await inn.el.play().catch(() => undefined);
+    // Wait for the incoming deck to start, but not forever: a play() that never settles must not hang the pull.
+    const started = await Promise.race([inn.el.play().then(() => true, () => false),
+                                        new Promise<null>((r) => window.setTimeout(() => r(null), PLAY_TIMEOUT_MS))]);
     if (inn.gen !== innGen) return;       // a later crossfade already reloaded this deck: it owns the swap and the announcement
+    if (started === null) this.onNextError(new Error(`"${next.title ?? next.id}" did not start within ${PLAY_TIMEOUT_MS / 1000} s — switching anyway`));
+    this.lastT = -1; this.lastMove = performance.now();
     const t0 = this.ctx.currentTime;
     out.gain.gain.cancelScheduledValues(t0); inn.gain.gain.cancelScheduledValues(t0);
     out.gain.gain.setValueAtTime(out.gain.gain.value, t0); inn.gain.gain.setValueAtTime(0, t0);
