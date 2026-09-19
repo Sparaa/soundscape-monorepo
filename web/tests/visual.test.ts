@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { sectionAt, sectionCues } from "@/lib/abc";
-import { BeatClock, adaptQuality, bandEnergies, frame, logSpectrum, meter, paletteFor } from "@/lib/visual";
+import { BeatClock, PunchDetector, adaptQuality, bandEnergies, frame, logSpectrum, meter, paletteFor } from "@/lib/visual";
 
 const SCORE = ["X:1", "M:4/4", "L:1/16", "Q:1/4=120", "V: Vocal", "V: Ins", "K:C",
   "% intro", "V: Vocal", "Z|Z|", "V: Ins", "C4E4G4c4|C4E4G4c4|",
@@ -94,5 +94,29 @@ describe("adaptQuality", () => {
     expect(adaptQuality(1, 5, 1000, false)).toBe(1);              // focus went to another window
     expect(adaptQuality(1, 2, 12000, true)).toBe(1);              // tab was frozen for 12 s
     expect(adaptQuality(0.5, 60, 1000, false)).toBe(0.5);         // nor climb while unfocused: nothing to see
+  });
+});
+
+describe("punch (percussive transients)", () => {
+  const quiet = new Array(64).fill(0.1);
+  it("fires on a broadband transient above the bass band, then decays", () => {
+    const d = new PunchDetector();
+    for (let i = 0; i < 30; i++) d.update(quiet);                      // settle the running floor
+    const snare = quiet.map((v, i) => (i >= 20 && i < 50 ? v + 0.35 : v));   // ~250 Hz–3 kHz burst: a snare, not a kick
+    const hit = d.update(snare);
+    expect(hit).toBeGreaterThan(0.8);
+    const after = [d.update(snare), d.update(snare), d.update(snare)];     // sustained level = no new flux → decays
+    expect(after[2]).toBeLessThan(hit * 0.6);
+    expect(after[2]).toBeGreaterThan(0);
+  });
+  it("adapts to the track: a steady rumble is not punch", () => {
+    const d = new PunchDetector();
+    let last = 0;
+    for (let i = 0; i < 60; i++) last = d.update(quiet.map((v, k) => v + 0.02 * Math.sin(i * 0.7 + k)));
+    expect(last).toBeLessThan(0.35);
+  });
+  it("rides along in the frame", () => {
+    const f = frame(1, { bass: 0, mid: 0, treble: 0, rms: 0 }, new BeatClock(120), [], paletteFor(null), null, 10, undefined, 0.7);
+    expect(f.beat.punch).toBe(0.7);
   });
 });

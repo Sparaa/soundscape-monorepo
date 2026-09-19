@@ -183,7 +183,7 @@ export function radial(bins = 36): Scene {
       }
       for (const m of [shadow, rays, ticks]) { m.instanceMatrix.needsUpdate = true; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
       grooves.forEach((g, i) => g.scale.setScalar(1 + 0.03 * f.bands.bass * (1 - i / 4)));
-      wheel.rotation.z = -t * 0.35 - f.beat.hit * 0.04; wheel.scale.setScalar(1 + 0.03 * f.beat.hit);
+      wheel.rotation.z = -t * 0.35 - f.beat.hit * 0.04 - (f.beat.punch ?? 0) * 0.05; wheel.scale.setScalar(1 + 0.03 * f.beat.hit + 0.08 * (f.beat.punch ?? 0));
       if (logo) { logo.rotation.z = -t * 0.35; logo.scale.setScalar(1 + 0.03 * f.beat.hit); }
     },
     dispose() { for (const g of [rayGeo, shadowGeo, tickGeo, ...spokeGeos]) g.dispose(); for (const m of [shadow.material, rays.material, ticks.material, discMat, grooveMat, wheelMat]) (m as THREE.Material).dispose(); },
@@ -276,9 +276,9 @@ export function pulse(bins = 64, segments = 26): Scene {
         level[i] = v > level[i] ? level[i] + (v - level[i]) * 0.6 : level[i] + (v - level[i]) * 0.14;
         peak[i] = Math.max(level[i], peak[i] - dt * 0.22);
       }
-      const flicker = 0.95 + 0.05 * Math.sin(t * 47.0) * Math.sin(t * 13.0);
+      const flicker = 0.95 + 0.05 * Math.sin(t * 47.0) * Math.sin(t * 13.0), punch = f.beat.punch ?? 0;
       for (let k = 0; k < N; k++) {
-        const i = k % bins, lv = Math.min(1, level[i] * (1 + 0.08 * f.beat.hit)), lit = Math.round(lv * segments), pk = Math.min(segments - 1, Math.round(peak[i] * segments));
+        const i = k % bins, lv = Math.min(1, level[i] * (1 + 0.08 * f.beat.hit + 0.06 * punch)), lit = Math.round(lv * segments), pk = Math.min(segments - 1, Math.round(peak[i] * segments));
         for (let j = 0; j < segments; j++) {
           if (j < lit) color.copy(j === lit - 1 ? HOT : LIT).multiplyScalar(flicker * (0.7 + 0.3 * (j / segments)));
           else if (j === pk && pk > 0) color.copy(PEAK).multiplyScalar(0.85 * flicker);
@@ -292,10 +292,11 @@ export function pulse(bins = 64, segments = 26): Scene {
       }
       bloom.instanceMatrix.needsUpdate = true;
       for (const m of [segs, ticks]) if (m.instanceColor) m.instanceColor.needsUpdate = true;
-      wheel.rotation.z = -t * 0.35 - f.beat.hit * 0.04; wheel.scale.setScalar(1 + 0.025 * f.beat.hit);
-      wheelGlow.opacity = 0.08 + 0.18 * f.bands.bass + 0.15 * f.beat.hit;
-      bezelMat.color.copy(LIT).multiplyScalar(0.6 + 0.4 * f.beat.hit);
-      discMat.color.setRGB(0.03 + 0.03 * f.bands.bass, 0.004, 0.008);
+      // the center rides the whole kit: `punch` (60 Hz–6 kHz transients) on top of the bass-locked beat `hit`
+      wheel.rotation.z = -t * 0.35 - f.beat.hit * 0.04 - punch * 0.05; wheel.scale.setScalar(1 + 0.025 * f.beat.hit + 0.10 * punch);
+      wheelGlow.opacity = 0.08 + 0.18 * f.bands.bass + 0.15 * f.beat.hit + 0.40 * punch;
+      bezelMat.color.copy(LIT).multiplyScalar(0.6 + 0.4 * f.beat.hit + 0.6 * punch);
+      discMat.color.setRGB(0.03 + 0.03 * f.bands.bass + 0.07 * punch, 0.004 + 0.012 * punch, 0.008 + 0.012 * punch);
     },
     dispose() { for (const g of [segGeo, bloomGeo, tickGeo, ...statics]) g.dispose(); for (const m of [segs.material, bloom.material, ticks.material, gridMat, discMat, bezelMat, lineMat, wheelMat, wheelGlow]) (m as THREE.Material).dispose(); },
   };

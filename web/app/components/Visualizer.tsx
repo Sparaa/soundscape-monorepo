@@ -5,7 +5,7 @@ import * as THREE from "three";
 import type { Song } from "@/lib/api";
 import { sectionCues, type SectionCue } from "@/lib/abc";
 import { SCENES, type Scene } from "@/lib/scenes";
-import { BeatClock, adaptQuality, bandEnergies, frame, logSpectrum, meter, paletteFor, type Palette, type VisualFrame } from "@/lib/visual";
+import { BeatClock, PunchDetector, adaptQuality, bandEnergies, frame, logSpectrum, meter, paletteFor, type Palette, type VisualFrame } from "@/lib/visual";
 import type { RadioPlayer } from "@/lib/player";
 
 export const FEED_CHANNEL = "soundscape-visual-feed";
@@ -42,6 +42,7 @@ export default function Visualizer({ player, song, tags, sceneName, onScene, lab
     const fft = new Uint8Array(analyser.frequencyBinCount);
     const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(FEED_CHANNEL) : null;
     let clock = new BeatClock(120, 0), cues: SectionCue[] = [], palette: Palette = paletteFor(null), cueSong: string | null = null;
+    const punchDet = new PunchDetector();
     let last = performance.now(), frames = 0, fpsT = last, raf = 0, quality = 1, hudT = 0;
     const resize = () => { const w = el.clientWidth, h = el.clientHeight; renderer.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); };
     resize();
@@ -62,7 +63,8 @@ export default function Visualizer({ player, song, tags, sceneName, onScene, lab
       const pos = player.position();
       clock.update(pos.t, bands.bass);
       const spectrum = logSpectrum(fft, player.ctx.sampleRate, analyser.fftSize, 64);
-      const f: VisualFrame = frame(pos.t, bands, clock, cues, palette, s ? { id: s.id, title: s.title, mode: s.plan?.mode ?? null } : null, pos.d, spectrum);
+      const punch = punchDet.update(spectrum);
+      const f: VisualFrame = frame(pos.t, bands, clock, cues, palette, s ? { id: s.id, title: s.title, mode: s.plan?.mode ?? null } : null, pos.d, spectrum, punch);
       sc.update(f, dt);
       renderer.render(scene3, cam);
       (window as unknown as { soundscapeFeed?: VisualFrame }).soundscapeFeed = f;
@@ -104,7 +106,7 @@ export default function Visualizer({ player, song, tags, sceneName, onScene, lab
             <div>BASS {meter(hud?.bands.bass ?? 0, 18)} {String(Math.round((hud?.bands.bass ?? 0) * 100)).padStart(3)}%</div>
             <div>MID  {meter((hud?.bands.mid ?? 0) * 1.6, 18)} {String(Math.round((hud?.bands.mid ?? 0) * 100)).padStart(3)}%</div>
             <div>TREB {meter((hud?.bands.treble ?? 0) * 3, 18)} {String(Math.round((hud?.bands.treble ?? 0) * 100)).padStart(3)}%</div>
-            <div style={{ color: "#a0141f" }}>BPM {hud?.beat.bpm ?? "---"} · BAR {hud?.beat.bar ?? 0} · BEAT {meter(1 - (hud?.beat.phase ?? 0), 4)} · SECTION :: {(hud?.section?.label ?? "—").toUpperCase()}{song?.plan ? ` · MODE :: ${song.plan.mode.toUpperCase()}` : ""}</div>
+            <div style={{ color: "#a0141f" }}>BPM {hud?.beat.bpm ?? "---"} · BAR {hud?.beat.bar ?? 0} · BEAT {meter(1 - (hud?.beat.phase ?? 0), 4)} · PUNCH {meter(hud?.beat.punch ?? 0, 4)} · SECTION :: {(hud?.section?.label ?? "—").toUpperCase()}{song?.plan ? ` · MODE :: ${song.plan.mode.toUpperCase()}` : ""}</div>
           </div>
         </>
       ) : (

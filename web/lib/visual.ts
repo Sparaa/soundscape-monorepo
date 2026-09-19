@@ -67,6 +67,31 @@ export class BeatClock {
   }
 }
 
+/** Percussive transient envelope ("punch"): positive spectral flux across the log spectrum from ~60 Hz to ~6 kHz
+ * (kick body, snare, claps, hat attacks), measured against the track's own running flux floor so quiet and loud mixes
+ * pulse alike; fast attack, ~100 ms decay. Unlike `BeatClock.hit` it has no refractory period and is not bass-only, so
+ * the center of the scope can move with the whole drum kit. Bins index the 64-bin logSpectrum (30 Hz–9 kHz). */
+export class PunchDetector {
+  private prev: number[] = [];
+  private avg = 0.02;
+  punch = 0;
+  constructor(public lo = 8, public hi = 60, public decay = 0.78, public gain = 2.5) {}
+  update(spec: number[]): number {
+    let flux = 0, n = 0;
+    for (let i = Math.max(0, this.lo); i < Math.min(spec.length, this.hi); i++) {
+      const d = spec[i] - (this.prev[i] ?? spec[i]);
+      if (d > 0) flux += d;
+      n++;
+    }
+    this.prev = spec.slice();
+    flux = n ? flux / n : 0;
+    this.avg += (flux - this.avg) * 0.05;
+    const raw = Math.min(1, Math.max(0, (flux - this.avg) / Math.max(0.004, this.avg * this.gain)));
+    this.punch = Math.max(raw, this.punch * this.decay);
+    return this.punch;
+  }
+}
+
 export interface Palette { hue: number; sat: number; light: number; accentHue: number; name: string }
 
 const MOOD_HUES: Record<string, number> = { dark: 260, epic: 30, energetic: 10, playful: 320, happy: 50, sad: 210, calm: 170, dreamy: 280, aggressive: 0, romantic: 340, melancholic: 220, hopeful: 100 };
@@ -87,7 +112,7 @@ export interface VisualFrame {
   v: 1;
   t: number;                       // playback position (s)
   bands: Bands;
-  beat: { phase: number; index: number; bar: number; bpm: number; hit: number };
+  beat: { phase: number; index: number; bar: number; bpm: number; hit: number; punch: number };
   section: { label: string; index: number; progress: number } | null;
   palette: Palette;
   song: { id: string; title: string | null; mode: string | null } | null;
@@ -95,14 +120,14 @@ export interface VisualFrame {
 }
 
 export function frame(t: number, bands: Bands, clock: BeatClock, cues: SectionCue[], palette: Palette,
-                      song: VisualFrame["song"], durationS: number, spectrum?: number[]): VisualFrame {
+                      song: VisualFrame["song"], durationS: number, spectrum?: number[], punch = 0): VisualFrame {
   let idx = -1;
   for (let i = 0; i < cues.length; i++) if (cues[i].t <= t) idx = i; else break;
   const section = idx >= 0 ? (() => {
     const start = cues[idx].t, end = idx + 1 < cues.length ? cues[idx + 1].t : Math.max(durationS, start + 1);
     return { label: cues[idx].label, index: idx, progress: Math.min(1, Math.max(0, (t - start) / Math.max(0.001, end - start))) };
   })() : null;
-  return { v: 1, t, bands, beat: { phase: clock.phase(t), index: clock.beatIndex(t), bar: clock.bar(t), bpm: clock.bpm, hit: clock.hit }, section, palette, song,
+  return { v: 1, t, bands, beat: { phase: clock.phase(t), index: clock.beatIndex(t), bar: clock.bar(t), bpm: clock.bpm, hit: clock.hit, punch }, section, palette, song,
            ...(spectrum ? { spectrum } : {}) };
 }
 
