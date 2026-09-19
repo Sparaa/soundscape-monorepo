@@ -97,12 +97,13 @@ describe("adaptQuality", () => {
   });
 });
 
-describe("punch (bass transients)", () => {
+describe("punch (audible bass transients)", () => {
   const quiet = new Array(64).fill(0.1);
-  it("fires on a kick (30–150 Hz burst), then decays", () => {
+  const bed = new Array(64).fill(0.6);                                  // an audible mix (~ -58 dBFS per bin)
+  it("fires on a kick (50–150 Hz burst at an audible level), then decays", () => {
     const d = new PunchDetector();
-    for (let i = 0; i < 30; i++) d.update(quiet);                      // settle the running floor
-    const kick = quiet.map((v, i) => (i < 16 ? v + 0.35 : v));          // 30–125 Hz burst: a kick / 808
+    for (let i = 0; i < 30; i++) d.update(bed);                        // settle the running floor
+    const kick = bed.map((v, i) => (i >= 6 && i < 18 ? v + 0.3 : v));   // 50–150 Hz burst: a kick / 808
     const hit = d.update(kick);
     expect(hit).toBeGreaterThan(0.8);
     const after = [d.update(kick), d.update(kick), d.update(kick)];     // sustained level = no new flux → decays
@@ -111,9 +112,21 @@ describe("punch (bass transients)", () => {
   });
   it("ignores a snare / vocal burst above the cutoff", () => {
     const d = new PunchDetector();
-    for (let i = 0; i < 30; i++) d.update(quiet);
-    const snare = quiet.map((v, i) => (i >= 20 && i < 50 ? v + 0.35 : v));   // ~180 Hz–3 kHz: snare body, vocals, hats
+    for (let i = 0; i < 30; i++) d.update(bed);
+    const snare = bed.map((v, i) => (i >= 20 && i < 50 ? v + 0.3 : v));   // ~180 Hz–3 kHz: snare body, vocals, hats
     expect(d.update(snare)).toBeLessThan(0.05);
+  });
+  it("ignores the same kick at an inaudible level (audibility gate)", () => {
+    const d = new PunchDetector();
+    for (let i = 0; i < 30; i++) d.update(quiet);
+    const faint = quiet.map((v, i) => (i >= 6 && i < 18 ? v + 0.3 : v));   // identical transient, ~ -90 dBFS bed
+    expect(d.update(faint)).toBeLessThan(0.05);
+  });
+  it("ignores sub-bass under ~50 Hz that speakers do not reproduce", () => {
+    const d = new PunchDetector();
+    for (let i = 0; i < 30; i++) d.update(bed);
+    const sub = bed.map((v, i) => (i < 6 ? v + 0.3 : v));
+    expect(d.update(sub)).toBeLessThan(0.05);
   });
   it("adapts to the track: a steady rumble is not punch", () => {
     const d = new PunchDetector();

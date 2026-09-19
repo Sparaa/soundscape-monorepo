@@ -292,7 +292,7 @@ export function pulse(bins = 64, segments = 26): Scene {
       }
       bloom.instanceMatrix.needsUpdate = true;
       for (const m of [segs, ticks]) if (m.instanceColor) m.instanceColor.needsUpdate = true;
-      // the center rides the bass: `punch` (30–150 Hz transients: kicks, 808s, bass plucks) on top of the beat-locked `hit`
+      // the center rides the bass: `punch` (audible 50–150 Hz transients: kicks, 808s, bass plucks) on top of the beat-locked `hit`
       wheel.rotation.z = -t * 0.35 - f.beat.hit * 0.04 - punch * 0.05; wheel.scale.setScalar(1 + 0.025 * f.beat.hit + 0.10 * punch);
       wheelGlow.opacity = 0.08 + 0.18 * f.bands.bass + 0.15 * f.beat.hit + 0.40 * punch;
       bezelMat.color.copy(LIT).multiplyScalar(0.6 + 0.4 * f.beat.hit + 0.6 * punch);
