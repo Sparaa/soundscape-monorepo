@@ -100,10 +100,21 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
     setErr(null); setMode("playlist"); plIndex.current = i;
     const p = getPlayer();
     try {
-      if (p.current.song) { await p.ctx.resume(); await p.crossfadeTo(items[i], 0.4); }
+      if (p.current.song) { await p.ctx.resume(); await p.playNow(async () => items[i], 0.4); }
       else await p.start(items[i]);
       setPaused(false);
     } catch (e) { setErr(String(e)); }
+  };
+  /** Play a cued song now (the Up next list is clickable): the API hands over that exact song and the buffer refills. */
+  const playCued = async (s: Song) => {
+    setErr(null); setMode("radio");
+    const p = getPlayer();
+    try {
+      if (paused || (status && status.state !== "playing" && status.state !== "warming")) { setStatus(await radioPlay(sid)); setPaused(false); }
+      const get = async () => { const r = await radioNext(sid, s.id); setStatus(r.status); return r.song; };
+      if (p.current.song) await p.playNow(get, 0.5);
+      else { const first = await get(); if (first) await p.start(first); }
+    } catch (e) { setErr(`play now: ${String(e).slice(0, 80)}`); }
   };
   /** Back to fresh songs: the agent resumes buffering; the current song plays out, Skip jumps to a new one. */
   const toRadio = async () => { setMode("radio"); try { setStatus(await radioPlay(sid)); } catch (e) { setErr(String(e)); } };
@@ -167,8 +178,13 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
         )}
         {status && status.ready.length > 0 && (
           <div className="text-xs text-zinc-400 flex flex-col gap-0.5">
-            <div className="uppercase tracking-widest text-zinc-500">Up next</div>
-            {status.ready.map((s) => <div key={s.id}>{s.title} <span className="text-zinc-600">· {planLabel(s.plan)} · {mmss(s.seconds)}</span></div>)}
+            <div className="uppercase tracking-widest text-zinc-500">Up next <span className="normal-case tracking-normal text-zinc-600">· click a song to play it now</span></div>
+            {status.ready.map((s) => (
+              <button key={s.id} onClick={() => playCued(s)} className="group flex items-center gap-2 text-left rounded px-1 -mx-1 hover:bg-zinc-900 hover:text-zinc-100" title="Play this song now">
+                <span className="text-zinc-600 group-hover:text-zinc-100">▸</span>
+                <span className="truncate">{s.title} <span className="text-zinc-600">· {planLabel(s.plan)} · {mmss(s.seconds)}</span></span>
+              </button>
+            ))}
           </div>
         )}
         {status && status.recent.some((s) => s.status === "rejected") && (

@@ -72,3 +72,20 @@ def test_radio_buffers_two_then_keeps_one_spare(tmp_path):
     assert listed == cued and len(listed) >= 3
     assert all(r["saved"] == 1 for r in con.execute("SELECT saved FROM songs WHERE status != 'rejected'"))
     assert con.execute("SELECT saved FROM songs WHERE status='rejected'").fetchone()["saved"] == 0
+
+
+def test_next_can_pick_a_specific_cued_song(tmp_path):
+    con = db.connect(tmp_path)
+    con.execute("INSERT INTO stations (id, name, created, profile, settings) VALUES ('s1','S',0,'{}','{}')")
+    con.commit()
+    store = radio.Store(con, tmp_path)
+    for i in range(3):
+        store.add_song("s1", {"id": f"song{i}", "title": f"t{i}", "style": "s", "lyrics": "l", "abc": None, "plan": {}, "seconds": 100.0,
+                             "path": str(tmp_path / f"{i}.flac"), "explain": "", "gate": {"ok": True, "reasons": []}}, status="ready")
+    r = radio.Radio("s1", store=store, renderer=None, loop_s=0.01)
+    assert r.next("song1")["id"] == "song1"                      # the clicked one, not the oldest
+    assert [s["id"] for s in store.ready("s1")] == ["song0", "song2"]
+    assert r.next("song1") is None                                # already played → nothing happens
+    assert r.next("nope") is None
+    assert r.next()["id"] == "song0"                              # plain next still pops the oldest
+    assert r.now_playing["id"] == "song0"

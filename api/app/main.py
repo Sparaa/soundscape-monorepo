@@ -294,10 +294,11 @@ def radio_stop(sid: str) -> dict:
 
 
 @app.post("/stations/{sid}/next")
-def radio_next(sid: str) -> dict:
+def radio_next(sid: str, song_id: Optional[str] = None) -> dict:
+    """Next cued song; `?song_id=` plays a specific cued one now (the Up next list is clickable)."""
     _station(sid)
     r = radio_for(sid)
-    song = r.next()
+    song = r.next(song_id)
     return {"song": song, "status": r.status()}
 
 

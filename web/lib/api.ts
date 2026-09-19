@@ -74,7 +74,10 @@ export interface RadioStatus { state: "stopped" | "warming" | "playing" | "stopp
 
 export async function radioPlay(id: string): Promise<RadioStatus> { return j(await fetch(`${API_URL}/stations/${id}/play`, { method: "POST" })); }
 export async function radioStop(id: string): Promise<RadioStatus> { return j(await fetch(`${API_URL}/stations/${id}/stop`, { method: "POST" })); }
-export async function radioNext(id: string): Promise<{ song: Song | null; status: RadioStatus }> { return j(await fetch(`${API_URL}/stations/${id}/next`, { method: "POST" })); }
+/** Pop the next cued song — or a specific cued one (`songId`) the listener clicked in Up next. */
+export async function radioNext(id: string, songId?: string): Promise<{ song: Song | null; status: RadioStatus }> {
+  return j(await fetch(`${API_URL}/stations/${id}/next${songId ? `?song_id=${encodeURIComponent(songId)}` : ""}`, { method: "POST" }));
+}
 export async function radioStatus(id: string): Promise<RadioStatus> { return j(await fetch(`${API_URL}/stations/${id}/radio`, { cache: "no-store" })); }
 export async function stationSongs(id: string): Promise<Song[]> { return j(await fetch(`${API_URL}/stations/${id}/songs`, { cache: "no-store" })); }
 export async function patchSong(id: string, flags: { saved?: boolean; liked?: boolean; vote?: -1 | 0 | 1; title?: string }): Promise<Song> {

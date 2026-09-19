@@ -56,9 +56,10 @@ class Radio:
             self._event("stop")
         self.now_playing = None
 
-    def next(self) -> Optional[dict[str, Any]]:
-        """Pop the next ready song (the client starts playing it). None → nothing cued yet."""
-        song = self.store.pop_ready(self.station_id)
+    def next(self, song_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """Pop the next ready song (the client starts playing it), or a specific cued one the listener picked.
+        None → nothing cued yet (or that song is no longer cued)."""
+        song = self.store.pop_ready(self.station_id, song_id)
         if song:
             self.now_playing = song
             if self.state == "warming":
@@ -186,8 +187,11 @@ class Store:
     def ready(self, sid: str) -> list[dict[str, Any]]:
         return [self._song(r) for r in self.con.execute("SELECT * FROM songs WHERE station_id=? AND status='ready' ORDER BY created", (sid,))]
 
-    def pop_ready(self, sid: str) -> Optional[dict[str, Any]]:
-        r = self.con.execute("SELECT * FROM songs WHERE station_id=? AND status='ready' ORDER BY created LIMIT 1", (sid,)).fetchone()
+    def pop_ready(self, sid: str, song_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+        if song_id:
+            r = self.con.execute("SELECT * FROM songs WHERE station_id=? AND id=? AND status='ready'", (sid, song_id)).fetchone()
+        else:
+            r = self.con.execute("SELECT * FROM songs WHERE station_id=? AND status='ready' ORDER BY created LIMIT 1", (sid,)).fetchone()
         if not r:
             return None
         self.con.execute("UPDATE songs SET status='played', played=? WHERE id=?", (time.time(), r["id"]))

@@ -16,7 +16,8 @@ export function crossfadeGains(t: number): { out: number; in: number } {
   return { out: Math.cos(x * Math.PI / 2), in: Math.sin(x * Math.PI / 2) };
 }
 
-export interface Deck { el: HTMLAudioElement; gain: GainNode; src: MediaElementAudioSourceNode; song: Song | null }
+/** `gen` counts loads: a fade-out cleanup scheduled for one load must not wipe the deck after a later load reused it. */
+export interface Deck { el: HTMLAudioElement; gain: GainNode; src: MediaElementAudioSourceNode; song: Song | null; gen: number }
 
 export class RadioPlayer {
   ctx: AudioContext;
@@ -31,6 +32,7 @@ export class RadioPlayer {
   private timer: number | null = null;
   private fetching = false;
   private retryAt = 0;      // performance.now() before which we don't ask again (nothing cued yet, or the last ask failed)
+  private playing = false;  // between start/resume/crossfadeTo and pause/stop: the radio is expected to keep going by itself
 
   constructor(audioUrl: (id: string) => string) {
     const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -48,7 +50,7 @@ export class RadioPlayer {
       gain.gain.value = 0;
       const src = this.ctx.createMediaElementSource(el);
       src.connect(gain).connect(this.master);
-      return { el, gain, src, song: null };
+      return { el, gain, src, song: null, gen: 0 };
     };
     this.decks = [mk(), mk()];
     this.audioUrl = audioUrl;
@@ -61,34 +63,49 @@ export class RadioPlayer {
   async start(first: Song): Promise<void> {
     await this.ctx.resume();
     this.load(this.current, first);
+    this.current.gain.gain.cancelScheduledValues(this.ctx.currentTime);
     this.current.gain.gain.value = 1;
+    this.playing = true;
+    this.ensureTicking();                 // before play(): a rejected play() must not leave the radio without its tick
     await this.current.el.play();
     this.onSongChange(first);
-    this.tick();
   }
 
   private load(deck: Deck, song: Song): void {
+    deck.gen++;
     deck.song = song;
     deck.el.src = this.audioUrl(song.id);
     deck.el.load();
   }
 
-  /** Called every 250 ms: near the end (or after it), fetch + start the next song on the standby deck and crossfade. */
+  /** Exactly one tick chain, whatever sequence of start / Stop / Play / crossfade got us here. */
+  private ensureTicking(): void {
+    if (this.timer === null) this.tick();
+  }
+
+  /** Called every 250 ms while playing: near the end (or after it), fetch + start the next song on the standby deck and
+   * crossfade. A deck that lost its song while we are meant to be playing (a stale cleanup, a media error) counts as
+   * "over" too, so the radio recovers by itself instead of sitting silent with songs cued. */
   private tick = (): void => {
-    const cur = this.current;
-    const dur = isFinite(cur.el.duration) && cur.el.duration > 0 ? cur.el.duration : cur.song?.seconds ?? null;
-    const due = cur.el.ended || cur.el.currentTime >= nextStartAt(dur);
-    if (due && !this.fetching && !this.standby.song && performance.now() >= this.retryAt) void this.pull(cur.el.ended ? 0.2 : CROSSFADE_S);
+    try {
+      const cur = this.current;
+      const dur = isFinite(cur.el.duration) && cur.el.duration > 0 ? cur.el.duration : cur.song?.seconds ?? null;
+      const over = !cur.song || cur.el.ended;
+      const due = this.playing && (over || cur.el.currentTime >= nextStartAt(dur));
+      if (due && !this.fetching && !this.standby.song && performance.now() >= this.retryAt) void this.pull(over ? 0.2 : CROSSFADE_S);
+    } catch (e) {
+      this.onNextError(e);                // never let one bad read kill the chain
+    }
     this.timer = window.setTimeout(this.tick, 250);
   };
 
   /** One attempt at the next song. `fetching` ALWAYS clears: a rejected fetch (API restarting mid-deploy, a blip) used to
    * leave it stuck and the radio silent after the song ended until the user pressed Skip. Nothing cued / failed → ask
    * again in a second (the agent is still composing), not every 250 ms. */
-  private async pull(crossfadeS: number): Promise<void> {
+  private async pull(crossfadeS: number, get: () => Promise<Song | null> = this.onNeedNext): Promise<void> {
     this.fetching = true;
     try {
-      const next = await this.onNeedNext();
+      const next = await get();
       if (next) await this.crossfadeTo(next, crossfadeS);
       else this.retryAt = performance.now() + 1000;
     } catch (e) {
@@ -102,23 +119,42 @@ export class RadioPlayer {
   async crossfadeTo(next: Song, seconds = CROSSFADE_S): Promise<void> {
     const out = this.current, inn = this.standby;
     this.load(inn, next);
+    const outGen = out.gen, innGen = inn.gen;
+    this.playing = true;
+    this.ensureTicking();
     await inn.el.play().catch(() => undefined);
+    if (inn.gen !== innGen) return;       // a later crossfade already reloaded this deck: it owns the swap and the announcement
     const t0 = this.ctx.currentTime;
     out.gain.gain.cancelScheduledValues(t0); inn.gain.gain.cancelScheduledValues(t0);
     out.gain.gain.setValueAtTime(out.gain.gain.value, t0); inn.gain.gain.setValueAtTime(0, t0);
     out.gain.gain.linearRampToValueAtTime(0, t0 + seconds); inn.gain.gain.linearRampToValueAtTime(1, t0 + seconds);
     this.active = 1 - this.active;
     this.onSongChange(next);
-    window.setTimeout(() => { out.el.pause(); out.el.removeAttribute("src"); out.el.load(); out.song = null; }, seconds * 1000 + 100);
+    // Release the faded-out deck — unless a second crossfade (Skip mid-fade, two playlist clicks in a row) reused it
+    // meanwhile: wiping it then killed the song that had just started and left the radio silent until the next Skip.
+    window.setTimeout(() => {
+      if (out.gen !== outGen || out === this.current) return;
+      out.el.pause(); out.el.removeAttribute("src"); out.el.load(); out.song = null;
+    }, seconds * 1000 + 100);
   }
 
+  /** Jump to whatever the radio has next. Ignored while an automatic pull is already in flight. */
   async skip(): Promise<void> {
-    const next = await this.onNeedNext();
-    if (next) await this.crossfadeTo(next, 0.5);
+    if (this.fetching) return;
+    await this.pull(0.5);
+  }
+
+  /** Play a specific song now (a cued one the listener picked, a saved one) through the same guarded path as the
+   * automatic pull. `get` may return null (the song is gone) → nothing changes. Returns false if a pull was in flight. */
+  async playNow(get: () => Promise<Song | null>, seconds = 0.5): Promise<boolean> {
+    if (this.fetching) return false;
+    await this.pull(seconds, get);
+    return true;
   }
 
   /** Stop = pause: the current song stays loaded so Play picks it up where it was (the server keeps a spare behind it). */
   pause(): void {
+    this.playing = false;
     if (this.timer) window.clearTimeout(this.timer);
     this.timer = null;
     for (const d of this.decks) d.el.pause();
@@ -128,16 +164,18 @@ export class RadioPlayer {
 
   async resume(): Promise<boolean> {
     if (!this.current.song) return false;
+    this.playing = true;
+    this.ensureTicking();
     await this.ctx.resume();
     await this.current.el.play();
-    this.tick();
     return true;
   }
 
   stop(): void {
+    this.playing = false;
     if (this.timer) window.clearTimeout(this.timer);
     this.timer = null;
-    for (const d of this.decks) { d.el.pause(); d.el.removeAttribute("src"); d.el.load(); d.song = null; d.gain.gain.value = 0; }
+    for (const d of this.decks) { d.gen++; d.el.pause(); d.el.removeAttribute("src"); d.el.load(); d.song = null; d.gain.gain.value = 0; }
     this.onSongChange(null);
   }
 

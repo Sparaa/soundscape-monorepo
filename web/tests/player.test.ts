@@ -26,7 +26,7 @@ class FakeAudio {
   src = ""; currentTime = 0; duration = NaN; ended = false; paused = true; crossOrigin = ""; preload = "";
   play() { this.paused = false; return Promise.resolve(); }
   pause() { this.paused = true; }
-  load() { if (!this.src) { this.duration = NaN; this.currentTime = 0; this.ended = false; } }
+  load() { this.duration = NaN; this.currentTime = 0; this.ended = false; this.paused = true; }   // like the media load algorithm
   removeAttribute(n: string) { if (n === "src") this.src = ""; }
 }
 const param = () => ({ value: 0, cancelScheduledValues() {}, setValueAtTime() {}, linearRampToValueAtTime() {} });
@@ -88,6 +88,111 @@ describe("RadioPlayer pulls the next song", () => {
     await vi.advanceTimersByTimeAsync(2100);
     expect(asks).toHaveBeenCalledTimes(3);
     expect(p.current.song?.id).toBe("b");
+    p.stop();
+  });
+});
+
+describe("RadioPlayer survives a second crossfade inside the first one's cleanup window", () => {
+  let audios: FakeAudio[];
+  beforeEach(() => {
+    audios = [];
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { AudioContext: FakeCtx, setTimeout, clearTimeout });
+    vi.stubGlobal("Audio", class extends FakeAudio { constructor() { super(); audios.push(this); } });
+    vi.stubGlobal("performance", { now: () => Date.now() });
+  });
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+  const deckOf = (id: string) => audios.find((x) => x.src === `/audio/${id}`);
+
+  it("two playlist clicks 1 s apart keep the second song playing and the radio advancing", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    const asks = vi.fn<() => Promise<Song | null>>().mockResolvedValue(song("d", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    await p.crossfadeTo(song("b", 100), 3);                    // click song b in the playlist
+    await vi.advanceTimersByTimeAsync(1000);
+    await p.crossfadeTo(song("c", 100), 0.4);                  // click song c a second later: lands on a's deck
+    await vi.advanceTimersByTimeAsync(4000);                   // a's 3.1 s cleanup fires meanwhile
+    expect(p.current.song?.id).toBe("c");                      // was: null — the cleanup wiped the deck now playing c
+    const c = deckOf("c")!;
+    expect(c.src).toBe("/audio/c");
+    expect(c.paused).toBe(false);
+    c.duration = 100; c.currentTime = 98;                      // c reaches its crossfade point → the radio must ask
+    await vi.advanceTimersByTimeAsync(600);
+    expect(asks).toHaveBeenCalledTimes(1);
+    expect(p.current.song?.id).toBe("d");
+    p.stop();
+  });
+
+  it("Skip during a natural crossfade keeps the skipped-to song", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    const asks = vi.fn<() => Promise<Song | null>>().mockResolvedValueOnce(song("b", 100)).mockResolvedValue(song("c", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    const a = audios[0];
+    a.duration = 100; a.currentTime = 98;                      // natural crossfade a → b (3 s)
+    await vi.advanceTimersByTimeAsync(300);
+    expect(p.current.song?.id).toBe("b");
+    await vi.advanceTimersByTimeAsync(1000);
+    await p.skip();                                            // user skips b 1 s into the fade: c lands on a's deck
+    expect(p.current.song?.id).toBe("c");
+    await vi.advanceTimersByTimeAsync(4000);                   // a's cleanup fires
+    expect(p.current.song?.id).toBe("c");
+    expect(deckOf("c")!.src).toBe("/audio/c");
+    expect(deckOf("c")!.paused).toBe(false);
+    p.stop();
+  });
+
+  it("recovers by itself if the playing deck loses its song (instead of sitting silent with songs cued)", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    const asks = vi.fn<() => Promise<Song | null>>().mockResolvedValue(song("b", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    Object.assign(p.current, { song: null }); p.current.el.removeAttribute("src"); p.current.el.load();   // whatever wiped it
+    await vi.advanceTimersByTimeAsync(600);
+    expect(asks).toHaveBeenCalledTimes(1);
+    expect(p.current.song?.id).toBe("b");
+    p.pause();
+    Object.assign(p.current, { song: null });                  // paused: nothing is expected to play, so no pull
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(asks).toHaveBeenCalledTimes(1);
+    p.stop();
+  });
+
+  it("Skip while an automatic pull is in flight does not fetch twice; Stop → Play keeps a single tick chain", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    let release: (s: Song) => void = () => {};
+    const asks = vi.fn<() => Promise<Song | null>>().mockImplementationOnce(() => new Promise((r) => { release = r; })).mockResolvedValue(song("c", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    audios[0].duration = 100; audios[0].currentTime = 98;
+    await vi.advanceTimersByTimeAsync(300);                    // tick asks; the API is slow
+    await p.skip();                                            // user hammers Skip meanwhile
+    expect(asks).toHaveBeenCalledTimes(1);
+    release(song("b", 100));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(p.current.song?.id).toBe("b");
+    await vi.advanceTimersByTimeAsync(3500);                   // a's fade-out finishes and its deck is released
+    p.pause(); await p.resume(); p.pause(); await p.resume();  // Stop / Play twice
+    deckOf("b")!.duration = 100; deckOf("b")!.currentTime = 98;
+    await vi.advanceTimersByTimeAsync(300);
+    expect(asks).toHaveBeenCalledTimes(2);                     // one chain, one ask
+    p.stop();
+  });
+
+  it("playNow swaps to a chosen cued song and keeps advancing from it", async () => {
+    const p = new RadioPlayer((id) => `/audio/${id}`);
+    const asks = vi.fn<() => Promise<Song | null>>().mockResolvedValue(song("z", 100));
+    p.onNeedNext = asks;
+    await p.start(song("a", 100));
+    expect(await p.playNow(async () => song("k", 100))).toBe(true);
+    expect(p.current.song?.id).toBe("k");
+    expect(deckOf("k")!.paused).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    deckOf("k")!.duration = 100; deckOf("k")!.currentTime = 99;
+    await vi.advanceTimersByTimeAsync(300);
+    expect(asks).toHaveBeenCalledTimes(1);
+    expect(p.current.song?.id).toBe("z");
     p.stop();
   });
 });
