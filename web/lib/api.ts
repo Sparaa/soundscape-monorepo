@@ -21,7 +21,7 @@ export interface Seed {
   key: string | null; bpm: number | null; sections: string[] | null; style_guess: string | null;
   promoted_sections: string[] | null; warnings: string[] | null; has_score: boolean;
 }
-export interface Station { id: string; name: string; created: number; profile: Profile | null; settings: { language?: string; covers?: number; blurb?: string; themes?: string[]; playlist_id?: string } | null; seeds: Seed[] }
+export interface Station { id: string; name: string; created: number; profile: Profile | null; settings: { language?: string; covers?: number; blurb?: string; themes?: string[]; playlist_id?: string } | null; seeds: Seed[]; songs: number }
 
 async function j<T>(r: Response): Promise<T> {
   if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 300)}`);
@@ -40,8 +40,25 @@ export async function getStation(id: string): Promise<Station> {
 export async function createStation(name: string, language = "English"): Promise<Station> {
   return j(await fetch(`${API_URL}/stations`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, language }) }));
 }
-export async function deleteStation(id: string): Promise<void> {
-  await j(await fetch(`${API_URL}/stations/${id}`, { method: "DELETE" }));
+/** Deletes the station, its seeds, its radio playlist and EVERY song it rendered (audio on disk included). */
+export async function deleteStation(id: string): Promise<{ ok: boolean; deleted_songs: number }> {
+  return j(await fetch(`${API_URL}/stations/${id}`, { method: "DELETE" }));
+}
+/** Start fresh: every song this station made is deleted and the agent starts a new list from the same seeds. */
+export async function radioFresh(id: string): Promise<{ ok: boolean; deleted_songs: number; status: RadioStatus }> {
+  return j(await fetch(`${API_URL}/stations/${id}/fresh`, { method: "POST" }));
+}
+/** "Delete “Title” and its audio from disk?" — one wording for every delete button. */
+export function deleteSongPrompt(song: { title: string | null; id: string }): string {
+  return `Delete “${song.title ?? song.id}” from disk? It leaves every playlist too.`;
+}
+export function deleteStationPrompt(st: { name: string; songs: number }): string {
+  const n = st.songs === 1 ? "its 1 song" : `all ${st.songs} of its songs`;
+  return `Delete station “${st.name}”? Its seeds, its playlist and ${n} are removed from disk. Export the playlist first if you want to keep the audio.`;
+}
+export function freshPrompt(st: { name: string; songs: number }): string {
+  const n = st.songs === 1 ? "its 1 song" : `all ${st.songs} of its songs`;
+  return `Start “${st.name}” fresh? This deletes ${n} from disk (the playlist empties) and the agent composes a new list from the same seeds.`;
 }
 export async function addSeedFile(stationId: string, file: File): Promise<Station> {
   const fd = new FormData();

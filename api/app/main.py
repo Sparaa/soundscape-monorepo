@@ -136,6 +136,7 @@ def _station(sid: str) -> dict[str, Any]:
         raise HTTPException(404, "station not found")
     s = _row(r)
     s["seeds"] = [_seed_summary(_row(x)) for x in con().execute("SELECT * FROM seeds WHERE station_id=? ORDER BY created", (sid,))]
+    s["songs"] = con().execute("SELECT COUNT(*) FROM songs WHERE station_id=? AND status != 'rejected'", (sid,)).fetchone()[0]
     return s
 
 
@@ -176,16 +177,42 @@ def get_station(sid: str) -> dict:
     return _station(sid)
 
 
+async def _wipe_songs(sid: str) -> int:
+    """Stop the station's radio (cancelling the render in flight) and delete every song it made, files included."""
+    await radio_for(sid).reset()
+    return len(await asyncio.to_thread(store().purge_songs, sid))
+
+
 @app.delete("/stations/{sid}")
-def delete_station(sid: str) -> dict:
-    _station(sid)
+async def delete_station(sid: str) -> dict:
+    """The station, its seeds, its radio playlist and EVERY song it rendered (audio on disk included)."""
+    st = _station(sid)
+    deleted = await _wipe_songs(sid)
+    state.get("radios", {}).pop(sid, None)
+    pid = (st.get("settings") or {}).get("playlist_id")
+    if pid:
+        con().execute("DELETE FROM playlist_items WHERE playlist_id=?", (pid,))
+        con().execute("DELETE FROM playlists WHERE id=?", (pid,))
     for r in con().execute("SELECT id FROM seeds WHERE station_id=?", (sid,)):
         for p in (config.LIBRARY_DIR / "seeds").glob(f"{r['id']}.*"):
             p.unlink(missing_ok=True)
     con().execute("DELETE FROM seeds WHERE station_id=?", (sid,))
     con().execute("DELETE FROM stations WHERE id=?", (sid,))
     con().commit()
-    return {"ok": True}
+    return {"ok": True, "deleted_songs": deleted}
+
+
+@app.post("/stations/{sid}/fresh")
+async def station_fresh(sid: str) -> dict:
+    """Start fresh: delete every song this station made (the playlist empties with them) and, when it has a profile,
+    start composing a new list from the same seeds right away. Seeds, profile, themes and settings are kept."""
+    st = _station(sid)
+    deleted = await _wipe_songs(sid)
+    r = radio_for(sid)
+    if st.get("profile"):
+        await _ensure_themes(sid)
+        r.play()
+    return {"ok": True, "deleted_songs": deleted, "status": r.status()}
 
 
 # ---- seeds ------------------------------------------------------------------

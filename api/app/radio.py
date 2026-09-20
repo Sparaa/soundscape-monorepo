@@ -56,6 +56,20 @@ class Radio:
             self._event("stop")
         self.now_playing = None
 
+    async def reset(self) -> None:
+        """Start fresh / station deleted: stop the loop, cancel the render in flight (the YuE2 job with it), forget
+        what was playing. The caller purges the songs; `play()` afterwards starts a new list from the seeds."""
+        for t in (self._task, self._render_task):        # loop first, or it starts another render in the gap
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._render_task = self._task = None
+        self.state, self.rendering, self.now_playing = "stopped", None, None
+        self._event("reset")
+
     def next(self, song_id: Optional[str] = None) -> Optional[dict[str, Any]]:
         """Pop the next ready song (the client starts playing it), or a specific cued one the listener picked.
         None → nothing cued yet (or that song is no longer cued)."""
@@ -231,6 +245,19 @@ class Store:
             library.add_item(self.con, pid, song_id)
         return pid
 
+    def purge_songs(self, sid: str) -> list[str]:
+        """Delete EVERY song of a station (cued, played, rejected): audio + sidecar JSON on disk, playlist memberships,
+        rows. The station, its seeds, profile, themes and playlist row stay — the list is rebuilt from the seeds."""
+        rows = self.con.execute("SELECT id, path FROM songs WHERE station_id=?", (sid,)).fetchall()
+        for r in rows:
+            for p in (Path(r["path"]), Path(r["path"]).with_suffix(".json")):
+                p.unlink(missing_ok=True)
+        ids = [r["id"] for r in rows]
+        self.con.execute("DELETE FROM playlist_items WHERE song_id IN (SELECT id FROM songs WHERE station_id=?)", (sid,))
+        self.con.execute("DELETE FROM songs WHERE station_id=?", (sid,))
+        self.con.commit()
+        return ids
+
     def backfill_auto_playlists(self) -> int:
         """Startup: songs cued before auto-save existed join their station's playlist (oldest first, idempotent)."""
         n = 0
@@ -276,8 +303,12 @@ def make_renderer(*, llm: llmmod.LLM, yue2, analyze_tags: Optional[Callable[[byt
         path.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(path.write_bytes, audio)            # 40 MB write + ffmpeg below: keep the event loop free
         progress("checking", 0.92)
-        tags = await analyze_tags(audio) if analyze_tags else None
-        verdict = await asyncio.to_thread(gate.check, path, profile_tags=profile.get("tags"), render_tags=tags, seconds=job.get("audio_seconds"))
+        try:
+            tags = await analyze_tags(audio) if analyze_tags else None
+            verdict = await asyncio.to_thread(gate.check, path, profile_tags=profile.get("tags"), render_tags=tags, seconds=job.get("audio_seconds"))
+        except asyncio.CancelledError:                              # reset during the check: no row will exist, so no orphan file
+            path.unlink(missing_ok=True)
+            raise
         out = {"id": song_id, "title": song.get("title") or plan.theme.title(), "style": request["style"], "lyrics": request["lyrics"],
                "abc": job.get("abc"), "plan": plan.to_dict(), "seconds": job.get("audio_seconds") or verdict["seconds"],
                "path": str(path), "explain": plan.explain, "gate": verdict, "tags": tags, "request": {k: v for k, v in request.items() if k not in ("abc", "hook_abc")},

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
@@ -9,6 +10,7 @@ import httpx
 from . import config
 from .abc import MusicError
 
+log = logging.getLogger("soundscape.composer")
 Progress = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
@@ -23,6 +25,7 @@ class Yue2:
                      timeout_s: float = 1800.0) -> tuple[bytes, dict[str, Any]]:
         """→ (flac bytes, job dict incl. abc/planned_seconds/audio_seconds)."""
         client = self._c()
+        job_id: Optional[str] = None
         try:
             body = {k: v for k, v in request.items() if k not in ("cover_mode", "vocal_promoted")}
             body.setdefault("priority", "background")   # a radio filling its buffer never delays someone's click on a shared sidecar
@@ -49,6 +52,13 @@ class Yue2:
             score = await client.get(f"{self.base_url}/jobs/{job_id}/score")
             s["abc"] = score.text if score.status_code == 200 else s.get("abc")
             return audio, s
+        except asyncio.CancelledError:       # the radio was reset (start fresh / station deleted): free the GPU too
+            if job_id:
+                try:
+                    await client.delete(f"{self.base_url}/jobs/{job_id}", timeout=10.0)
+                except Exception as e:
+                    log.warning("cancel yue2 job %s: %s", job_id, e)
+            raise
         finally:
             if self.client is None:
                 await client.aclose()

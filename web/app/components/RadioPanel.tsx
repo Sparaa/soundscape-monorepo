@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { patchSettings, patchSong, planLabel, playlistExportUrl, radioNext, radioPlay, radioStatus, radioStop, removeFromPlaylist, songAudioUrl, stationPlaylist, type Playlist, type RadioStatus, type Song, type Station } from "@/lib/api";
+import { deleteSong, deleteSongPrompt, freshPrompt, getStation, patchSettings, patchSong, planLabel, playlistExportUrl, radioFresh, radioNext, radioPlay, radioStatus, radioStop, removeFromPlaylist, songAudioUrl, stationPlaylist, type Playlist, type RadioStatus, type Song, type Station } from "@/lib/api";
 import { mmss } from "@/lib/profile";
 import { RadioPlayer } from "@/lib/player";
 import Visualizer from "@/app/components/Visualizer";
@@ -129,6 +129,33 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
       await getPlayer().skip();
     } catch (e) { setErr(`skip: ${String(e).slice(0, 80)}`); }
   };
+  /** Start fresh: every song this station made is deleted (the playlist empties), the agent composes a new list from
+   *  the same seeds, and playback starts as soon as the first one cues — the same path as a first Play. */
+  const onFresh = async () => {
+    if (!confirm(freshPrompt({ name: station.name, songs: playlist?.items.length ?? station.songs }))) return;
+    setErr(null);
+    player.current?.stop();                                          // silence now; the song it held is about to be deleted
+    setPaused(true); setMode("radio"); plIndex.current = -1;
+    try {
+      const r = await radioFresh(sid);
+      setStatus(r.status);
+      setPlaylist(await stationPlaylist(sid));
+      onStation(await getStation(sid));
+      if (station.profile) await onPlay();
+    } catch (e) { setErr(`start fresh: ${String(e).slice(0, 120)}`); }
+  };
+  /** Delete one song from disk (it leaves every playlist). If it is the one playing, playback stops first. */
+  const onDeleteSong = async (s: Song) => {
+    if (!confirm(deleteSongPrompt(s))) return;
+    setErr(null);
+    if (song?.id === s.id) { player.current?.stop(); setPaused(true); }
+    try {
+      await deleteSong(s.id);
+      setPlaylist(await stationPlaylist(sid));
+      onStation(await getStation(sid));
+      void refresh();
+    } catch (e) { setErr(`delete: ${String(e).slice(0, 120)}`); }
+  };
   const flag = async (s: Song, flags: { saved?: boolean; liked?: boolean; vote?: -1 | 0 | 1 }) => {
     const u = await patchSong(s.id, flags);
     if (song?.id === s.id) setSong(u);
@@ -213,6 +240,7 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
               <button onClick={() => playSaved(0)} disabled={!playlist?.items.length} className="px-2 py-0.5 rounded border border-zinc-700 text-zinc-300 disabled:opacity-40">▸ play all</button>
               {playlist && <Link href={`/playlists/${playlist.id}`} className="hover:text-zinc-200">reorder →</Link>}
               {playlist && <a href={playlistExportUrl(playlist.id)} className="hover:text-zinc-200">export .zip</a>}
+              {station.profile && <button onClick={onFresh} className="ml-auto px-2 py-0.5 rounded border border-zinc-800 text-zinc-500 hover:text-red-300 hover:border-red-400/60" title="Delete every song this station made and compose a new list from the same seeds">⟲ start fresh</button>}
             </div>
             {playlist && playlist.items.length === 0 && <div className="text-sm text-zinc-500">Every song the radio cues lands here, ready to play again.</div>}
             <div className="flex flex-col max-h-[22rem] overflow-y-auto -mx-1">
@@ -226,7 +254,8 @@ export default function RadioPanel({ station, onStation, seedsPane, profilePane 
                       <div className="text-[11px] text-zinc-500 truncate">{planLabel(s.plan) || s.explain}</div>
                     </button>
                     <span className="text-[11px] text-zinc-500 font-mono">{s.vote > 0 ? "↑ " : s.vote < 0 ? "↓ " : ""}{mmss(s.seconds)}</span>
-                    <button onClick={async () => { if (playlist) setPlaylist(await removeFromPlaylist(playlist.id, s.id)); }} className="text-zinc-700 hover:text-red-400 text-xs opacity-0 group-hover:opacity-100" title="Remove from this playlist (the file stays in the library)">✕</button>
+                    <button onClick={async () => { if (playlist) setPlaylist(await removeFromPlaylist(playlist.id, s.id)); }} className="text-zinc-700 hover:text-zinc-100 text-xs opacity-0 group-hover:opacity-100" title="Take it off this playlist (the file stays in the library)">−</button>
+                    <button onClick={() => onDeleteSong(s)} className="text-zinc-700 hover:text-red-400 text-xs opacity-0 group-hover:opacity-100" title="Delete this song and its audio from disk">✕</button>
                   </div>
                 );
               })}
