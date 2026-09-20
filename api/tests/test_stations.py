@@ -39,7 +39,7 @@ def test_station_lifecycle_with_upload_and_link(monkeypatch):
     assert c.post(f"/stations/{sid}/seeds", data={"url": "not a url"}).status_code == 400
     r = c.delete(f"/seeds/{seed_id}")
     assert len(r.json()["seeds"]) == 1 and r.json()["profile"]["seeds"] == 1
-    assert c.delete(f"/stations/{sid}").json() == {"ok": True}
+    assert c.delete(f"/stations/{sid}").json() == {"ok": True, "deleted_songs": 0}
     assert c.get(f"/stations/{sid}").status_code == 404
 
 
@@ -115,3 +115,64 @@ def test_concurrent_reads_never_lose_a_station():
         with cf.ThreadPoolExecutor(24) as ex:
             codes = list(ex.map(lambda i: c.get(paths[i % len(paths)]).status_code, range(360)))
         assert set(codes) == {200}, {k: codes.count(k) for k in set(codes)}
+
+
+def test_start_fresh_and_delete_station_remove_the_songs(tmp_path, monkeypatch):
+    import json, time
+    from app import config, radio
+    monkeypatch.setattr(config, "LIBRARY_DIR", tmp_path)
+    main.reset_db()
+    rendered = []
+
+    async def fake_render(station, seeds, plan, progress):
+        await asyncio.sleep(0.02)
+        sid = f"new{len(rendered)}"; rendered.append(sid)
+        p = tmp_path / "songs" / f"{sid}.flac"; p.write_bytes(b"fLaC")
+        return {"id": sid, "title": sid, "style": "s", "lyrics": "l", "abc": None, "plan": plan.to_dict(), "seconds": 120.0,
+                "path": str(p), "explain": plan.explain, "gate": {"ok": True, "reasons": []}}
+
+    async def no_themes(sid):
+        return None
+    monkeypatch.setattr(main, "renderer", lambda: fake_render)
+    monkeypatch.setattr(main, "_ensure_themes", no_themes)
+    with TestClient(main.app) as c:
+        sid = c.post("/stations", json={"name": "Fresh"}).json()["id"]
+        prof = {"style": "English, pop, 110 BPM", "bpm": {"low": 100, "high": 120, "center": 110}, "keys": [], "tags": {}, "sections": ["verse"], "phrases": {}}
+        main.con().execute("UPDATE stations SET profile=? WHERE id=?", (json.dumps(prof), sid))
+        main.con().execute("INSERT INTO seeds (id, station_id, title, source, seconds, analysis, created) VALUES ('sd1',?,'seed','upload',30,?,?)", (sid, json.dumps(ANALYSIS), time.time()))
+        main.con().commit()
+        (tmp_path / "seeds").mkdir(exist_ok=True); (tmp_path / "seeds" / "sd1.mp3").write_bytes(b"ID3")
+        st = main.store()
+        for i in range(2):
+            p = tmp_path / "songs" / f"old{i}.flac"; p.write_bytes(b"fLaC"); p.with_suffix(".json").write_text("{}")
+            st.add_song(sid, {"id": f"old{i}", "title": f"old {i}", "style": "s", "lyrics": "l", "abc": None, "plan": {"mode": "inspired"}, "seconds": 100.0,
+                              "path": str(p), "explain": "", "gate": {"ok": True, "reasons": []}}, status="ready")
+        st.add_song(sid, {"id": "rej", "title": "rejected", "style": "s", "lyrics": "l", "abc": None, "plan": {"mode": "inspired"}, "seconds": 10.0,
+                          "path": str(tmp_path / "songs" / "rej.flac"), "explain": "", "gate": {"ok": False, "reasons": ["too short"]}}, status="rejected")
+        pid = st.auto_playlist(sid)
+        assert c.get(f"/stations/{sid}").json()["songs"] == 2 and len(c.get(f"/stations/{sid}/playlist").json()["items"]) == 2
+
+        r = c.post(f"/stations/{sid}/fresh")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["deleted_songs"] == 3 and body["status"]["state"] == "warming" and body["status"]["ready"] == []
+        assert not (tmp_path / "songs" / "old0.flac").exists() and not (tmp_path / "songs" / "old1.json").exists()
+        assert c.get(f"/stations/{sid}/playlist").json() == c.get(f"/playlists/{pid}").json()      # same playlist row, now empty
+        assert c.get(f"/playlists/{pid}").json()["items"] == []
+        s = c.get(f"/stations/{sid}").json()
+        assert s["songs"] == 0 and len(s["seeds"]) == 1 and s["profile"]["style"] == prof["style"] and s["settings"]["playlist_id"] == pid
+        for _ in range(100):                            # the agent composes a new list from the same seeds right away
+            time.sleep(0.02)
+            if c.get(f"/stations/{sid}/radio").json()["ready"]:
+                break
+        ready = c.get(f"/stations/{sid}/radio").json()["ready"]
+        assert ready and ready[0]["id"].startswith("new")
+        assert c.get(f"/stations/{sid}/playlist").json()["items"][0]["id"] == ready[0]["id"]     # and the playlist refills
+
+        r = c.delete(f"/stations/{sid}")
+        assert r.status_code == 200 and r.json()["deleted_songs"] >= 1
+        assert c.get(f"/stations/{sid}").status_code == 404 and c.get(f"/playlists/{pid}").status_code == 404
+        assert main.con().execute("SELECT COUNT(*) FROM songs WHERE station_id=?", (sid,)).fetchone()[0] == 0
+        assert not list((tmp_path / "songs").glob("new*.flac")) and not (tmp_path / "seeds" / "sd1.mp3").exists()
+        assert sid not in main.state.get("radios", {})
+    main.reset_db()

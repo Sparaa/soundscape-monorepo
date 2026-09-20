@@ -1,7 +1,7 @@
 "use client";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { createStation, deleteStation, getHealth, listStations, sidecarLine, type Health, type Station } from "@/lib/api";
+import { createStation, deleteStation, deleteStationPrompt, getHealth, listStations, sidecarLine, type Health, type Station } from "@/lib/api";
 import { profileHeadline } from "@/lib/profile";
 
 export default function Home() {
@@ -36,9 +36,10 @@ export default function Home() {
           <div key={s.id} className="flex items-center gap-3 border border-zinc-800 rounded-xl px-4 py-3">
             <Link href={`/stations/${s.id}`} className="flex-1">
               <div className="font-medium">{s.name}</div>
-              <div className="text-xs text-zinc-400">{s.profile ? profileHeadline(s.profile) : `${s.seeds.length} seed(s) — add a song to build the profile`}</div>
+              <div className="text-xs text-zinc-400">{s.profile ? profileHeadline(s.profile) : `${s.seeds.length} seed(s) — add a song to build the profile`}{s.songs ? ` · ${s.songs} song${s.songs === 1 ? "" : "s"}` : ""}</div>
             </Link>
-            <button onClick={() => deleteStation(s.id).then(refresh).catch((e) => setErr(String(e)))} className="text-xs text-zinc-500 hover:text-red-400">delete</button>
+            <button onClick={() => { if (confirm(deleteStationPrompt(s))) deleteStation(s.id).then(refresh).catch((e) => setErr(String(e))); }}
+                    className="text-xs text-zinc-500 hover:text-red-400" title="Delete this station, its seeds and all its songs">delete</button>
           </div>
         ))}
       </section>

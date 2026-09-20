@@ -1,13 +1,14 @@
 "use client";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { addSeedFile, addSeedUrl, deleteSeed, getStation, seedAudioUrl, type Station } from "@/lib/api";
+import { addSeedFile, addSeedUrl, deleteSeed, deleteStation, deleteStationPrompt, getStation, seedAudioUrl, type Station } from "@/lib/api";
 import { TAG_ORDER, profileHeadline, seedLine, tagChips } from "@/lib/profile";
 import RadioPanel from "@/app/components/RadioPanel";
 
 export default function StationPage() {
   const { id } = useParams<{ id: string }>();
+  const router = useRouter();
   const [st, setSt] = useState<Station | null>(null);
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -18,6 +19,10 @@ export default function StationPage() {
     setErr(null); setBusy(label);
     try { setSt(await fn()); } catch (e) { setErr(String(e)); } finally { setBusy(null); }
   };
+  const onDeleteStation = async () => {
+    if (!st || !confirm(deleteStationPrompt(st))) return;
+    try { await deleteStation(st.id); router.push("/"); } catch (e) { setErr(String(e)); }
+  };
   if (!st) return <main className="p-8 text-zinc-400">{err ?? "Loading…"}</main>;
   const p = st.profile;
   return (
@@ -25,7 +30,8 @@ export default function StationPage() {
       <aside className="fixed top-0 right-0 h-screen w-full sm:w-[420px] overflow-y-auto p-4 flex flex-col gap-4 z-10">
       <header className="pane flex items-baseline gap-3">
         <Link href="/" className="text-zinc-400 hover:text-zinc-100 text-sm">← stations</Link>
-        <h1 className="text-xl font-semibold tracking-tight">{st.name}</h1>
+        <h1 className="text-xl font-semibold tracking-tight flex-1 min-w-0 truncate">{st.name}</h1>
+        <button onClick={onDeleteStation} className="text-xs text-zinc-500 hover:text-red-400 whitespace-nowrap" title="Delete this station, its seeds and all its songs">delete station</button>
       </header>
       <RadioPanel station={st} onStation={setSt}
         seedsPane={(

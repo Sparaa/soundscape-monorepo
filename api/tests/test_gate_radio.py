@@ -1,7 +1,7 @@
 import asyncio, json
 from pathlib import Path
 
-from app import agent, db, gate, radio
+from app import agent, db, gate, library, radio
 
 
 def test_gate_reasons(tmp_path):
@@ -89,3 +89,89 @@ def test_next_can_pick_a_specific_cued_song(tmp_path):
     assert r.next("nope") is None
     assert r.next()["id"] == "song0"                              # plain next still pops the oldest
     assert r.now_playing["id"] == "song0"
+
+
+def test_reset_cancels_the_render_and_purge_wipes_the_station(tmp_path):
+    con = db.connect(tmp_path)
+    con.execute("INSERT INTO stations (id, name, created, profile, settings) VALUES ('s1','S',0,?,?)",
+                (json.dumps({"style": "English, pop, 110 BPM", "bpm": {"low": 100, "high": 120, "center": 110}, "keys": [], "tags": {}}), json.dumps({})))
+    con.commit()
+    store = radio.Store(con, tmp_path)
+    started, cancelled = [], []
+
+    async def slow_render(station, seeds, plan, progress):
+        started.append(plan.mode)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(plan.mode)
+            raise
+        raise AssertionError("never finishes")
+
+    # an earlier session's songs, with files on disk, in the auto playlist (and one in a hand-made playlist)
+    for i in range(2):
+        p = tmp_path / "songs" / f"old{i}.flac"; p.parent.mkdir(exist_ok=True); p.write_bytes(b"fLaC"); p.with_suffix(".json").write_text("{}")
+        store.add_song("s1", {"id": f"old{i}", "title": f"t{i}", "style": "s", "lyrics": "l", "abc": None, "plan": {"mode": "inspired"}, "seconds": 100.0,
+                             "path": str(p), "explain": "", "gate": {"ok": True, "reasons": []}}, status="ready")
+    mine = library.create_playlist(con, "mine"); library.add_item(con, mine, "old1")
+    keep = tmp_path / "songs" / "import.flac"; keep.write_bytes(b"fLaC")
+    con.execute("INSERT INTO songs (id, station_id, title, path, created, status, saved) VALUES ('imp', NULL, 'my import', ?, 0, 'played', 1)", (str(keep),))
+    con.commit()
+
+    async def scenario():
+        r = radio.Radio("s1", store=store, renderer=slow_render, loop_s=0.01)
+        r.next()                                       # one playing, one cued → target 2 → a render starts
+        r.play()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if r.rendering is not None:
+                break
+        assert r.state == "playing" and r.rendering is not None and started == ["inspired"]
+        await r.reset()
+        assert cancelled == ["inspired"] and r.state == "stopped" and r.rendering is None and r.now_playing is None
+        assert r._task is None and r._render_task is None
+        await asyncio.sleep(0.05)
+        assert len(started) == 1                       # the loop is gone: nothing restarted behind our back
+        gone = store.purge_songs("s1")
+        assert sorted(gone) == ["old0", "old1"]
+        assert store.ready("s1") == [] and store.history("s1") == []
+        assert r.status()["events"][-1]["kind"] == "reset"
+        r.play()                                       # start fresh: the loop comes back and composes from scratch
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(started) == 2:
+                break
+        assert r.state == "warming" and len(started) == 2
+        await r.reset()
+    asyncio.run(scenario())
+    assert not (tmp_path / "songs" / "old0.flac").exists() and not (tmp_path / "songs" / "old1.json").exists()
+    assert keep.exists()                                                       # other stations' / imported songs untouched
+    assert con.execute("SELECT COUNT(*) FROM songs").fetchone()[0] == 1
+    assert con.execute("SELECT COUNT(*) FROM playlist_items").fetchone()[0] == 0   # memberships (auto + hand-made) gone with the songs
+    assert con.execute("SELECT COUNT(*) FROM playlists").fetchone()[0] == 2        # the playlists themselves stay
+
+
+def test_cancelled_render_cancels_the_yue2_job():
+    import httpx
+    from app import composer
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append((req.method, req.url.path))
+        if req.method == "POST":
+            return httpx.Response(200, json={"job_id": "j1"})
+        if req.method == "DELETE":
+            return httpx.Response(200, json={"state": "cancelled"})
+        return httpx.Response(200, json={"state": "running", "progress": 0.2})
+
+    async def scenario():
+        y = composer.Yue2("http://yue2", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        t = asyncio.create_task(y.render({"style": "s", "lyrics": "l"}, poll_s=0.01))
+        await asyncio.sleep(0.05)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    asyncio.run(scenario())
+    assert seen[0] == ("POST", "/generate") and ("GET", "/jobs/j1") in seen and seen[-1] == ("DELETE", "/jobs/j1")

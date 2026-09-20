@@ -4,7 +4,7 @@ import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import SongRow from "@/app/components/SongRow";
 import Visualizer from "@/app/components/Visualizer";
-import { getPlaylist, moveItem, playlistExportUrl, removeFromPlaylist, reorderPlaylist, songAudioUrl, type Playlist, type Song } from "@/lib/api";
+import { deleteSong, deleteSongPrompt, getPlaylist, moveItem, playlistExportUrl, removeFromPlaylist, reorderPlaylist, songAudioUrl, type Playlist, type Song } from "@/lib/api";
 import { RadioPlayer } from "@/lib/player";
 import { mmss } from "@/lib/profile";
 
@@ -50,7 +50,8 @@ export default function PlaylistPage() {
                    <button onClick={() => playFrom(i)} className="px-2 py-1 rounded border border-zinc-700">▸</button>
                    <button onClick={() => reorder(i, i - 1)} disabled={i === 0} className="px-2 py-1 rounded border border-zinc-800 disabled:opacity-30">↑</button>
                    <button onClick={() => reorder(i, i + 1)} disabled={i === pl.items.length - 1} className="px-2 py-1 rounded border border-zinc-800 disabled:opacity-30">↓</button>
-                   <button onClick={async () => setPl(await removeFromPlaylist(pl.id, s.id))} className="px-2 py-1 text-zinc-500 hover:text-red-400">remove</button>
+                   <button onClick={async () => setPl(await removeFromPlaylist(pl.id, s.id))} className="px-2 py-1 text-zinc-500 hover:text-zinc-200" title="Take it off this playlist (the file stays in the library)">remove</button>
+                   <button onClick={async () => { if (confirm(deleteSongPrompt(s))) { await deleteSong(s.id); setPl(await getPlaylist(pl.id)); } }} className="px-2 py-1 text-zinc-500 hover:text-red-400" title="Delete the song and its audio from disk">delete</button>
                  </span>} />
       ))}
     </main>
